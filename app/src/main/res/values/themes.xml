@@ -1,0 +1,4 @@
+<resources>
+    <!-- NoActionBar lets the app render its own toolbar and status chrome in Compose. -->
+    <style name="Theme.MedWandDeveloperSuiteAndroid" parent="android:style/Theme.Material.Light.NoActionBar" />
+</resources>
