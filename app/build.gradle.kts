@@ -1,7 +1,25 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use { load(it) }
+    }
+}
+
+fun localProperty(name: String): String {
+    return localProperties.getProperty(name)
+        ?: error("Missing $name in local.properties")
+}
+
+fun String.toBuildConfigString(): String {
+    return "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 }
 
 kotlin {
@@ -20,11 +38,24 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "3.0.1.0"
+
+        buildConfigField(
+            "String",
+            "MW_SDK_LICENSE",
+            localProperty("MW_SDK_LICENSE").toBuildConfigString()
+        )
+
+        buildConfigField(
+            "String",
+            "MW_SDK_PUBLIC_KEY",
+            localProperty("MW_SDK_PUBLIC_KEY").toBuildConfigString()
+        )
     }
 
     buildFeatures {
         // The application shell and workflow screens are rendered with Compose.
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

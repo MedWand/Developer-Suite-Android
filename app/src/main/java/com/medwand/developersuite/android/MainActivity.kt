@@ -1,5 +1,6 @@
 package com.medwand.developersuite.android
 
+import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
 import android.graphics.Bitmap
@@ -8,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
@@ -16,6 +18,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
@@ -59,10 +63,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.medwand.developersuite.android.BuildConfig
 import com.medwand.sdk_core.Core.EnumReadingState
 import com.medwand.sdk_core.Core.EnumSensor
 import com.medwand.sdk_core.Core.MedWandDeviceError
 import com.medwand.sdk_core.Core.MedWandReading
+import com.medwand.sdk_core.Internal.StethoscopeHelpers
 import com.medwand.sdk_core.MedWandController
 import com.medwand.sdk_core.Modules.EcgRenderTarget
 import kotlinx.coroutines.CompletableDeferred
@@ -109,15 +115,15 @@ private object Settings {
     const val AppCopyright = "2026"
     const val AppVersion = "3.0.1.0"
     const val AppBuild = "Unknown Build"
-    const val MwSdkLicense = """"""
-    const val MwSdkPublicKey = """"""
+    const val MwSdkLicense = BuildConfig.MW_SDK_LICENSE
+    const val MwSdkPublicKey = BuildConfig.MW_SDK_PUBLIC_KEY
 }
 
 /** Private broadcast action used to receive the Android USB permission result. */
 private const val ACTION_USB_PERMISSION = "com.medwand.developersuite.android.USB_PERMISSION"
 
 private const val StartupNoticeMessage =
-    "This is a BETA only sample application and SDK. This is not intended for use in production and should only be used for initial development work. The Stethoscope and Camera are not functional in this version. You will still need to request a license through your sales representative."
+    "This is a BETA only sample application and SDK. This is not intended for use in production and should only be used for initial development work. The Camera is not functional in this version. You will still need to request a license through your sales representative."
 
 /**
  * Shared action state for workflow buttons and navigation locking.
@@ -187,8 +193,18 @@ private class MainWindow(private val activity: Activity) {
     private var _medWandController: MedWandController? = null
     private var _thermometerView: ThermometerView? = null
     private var _pulseOximeterView: PulseOximeterView? = null
+    private var _stethoscopeView: StethoscopeView? = null
     private var _ecgView: EcgView? = null
     private var _currentSensorView: ISensorView? by mutableStateOf(null)
+
+    private var _audioPermissionResult: CompletableDeferred<Boolean>? = null
+    private val _audioPermissionLauncher: ActivityResultLauncher<String>? =
+        (activity as? ComponentActivity)?.registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            _audioPermissionResult?.complete(granted)
+            _audioPermissionResult = null
+        }
 
     private val GeneralStatus: String
         get() = "Device: ${_medWandController?.comPort}/${_medWandController?.vendorId}/${_medWandController?.productId} | ${_medWandController?.udi} | ${_medWandController?.generation} v${_medWandController?.firmwareVersion}"
@@ -412,6 +428,11 @@ private class MainWindow(private val activity: Activity) {
             requireNotNull(_medWandController),
             locked = { CurrentSensorView_ViewLockStateChanged(locked = it) }
         )
+        _stethoscopeView = StethoscopeView(
+            requireNotNull(_medWandController),
+            File(activity.filesDir, "captures.txt"),
+            { CurrentSensorView_ViewLockStateChanged(locked = it) }
+        )
         _ecgView = EcgView(
             requireNotNull(_medWandController),
             capturesFile = File(activity.filesDir, "captures.txt"),
@@ -425,9 +446,8 @@ private class MainWindow(private val activity: Activity) {
 
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
-        // Camera and Stethoscope are shown in the toolbar but are disabled in
-        // this application, so their click handlers do not open workflows.
-        ToolButtonStethoscopeEnabled = false
+        ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
+        // Camera is shown in the toolbar but disabled in this application.
         ToolButtonCameraEnabled = false
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
@@ -470,15 +490,14 @@ private class MainWindow(private val activity: Activity) {
     }
 
     /**
-     * Updates toolbar enabled state while preserving disabled Camera and
-     * Stethoscope affordances.
+     * Updates toolbar enabled state while preserving the disabled Camera affordance.
      */
     private fun SetNavigation(enabled: Boolean, exitEnabled: Boolean) {
         ToolButtonThermometerEnabled = enabled
         ToolButtonPulseOximeterEnabled = enabled
-        ToolButtonStethoscopeEnabled = false
+        ToolButtonStethoscopeEnabled = enabled && _medWandController?.hasValidStethoscope == true
         ToolButtonCameraEnabled = false
-        ToolButtonEcgEnabled = enabled
+        ToolButtonEcgEnabled = enabled && _medWandController?.hasValidEcg == true
         ToolButtonSummaryEnabled = enabled
         ToolButtonExitEnabled = exitEnabled
     }
@@ -520,9 +539,11 @@ private class MainWindow(private val activity: Activity) {
 
         _thermometerView?.close()
         _pulseOximeterView?.close()
+        _stethoscopeView?.close()
         _ecgView?.close()
         _thermometerView = null
         _pulseOximeterView = null
+        _stethoscopeView = null
         _ecgView = null
 
         // StopSensor is called during cleanup so any currently active sensor is
@@ -547,8 +568,17 @@ private class MainWindow(private val activity: Activity) {
         _pulseOximeterView?.let { ShowView(it) }
     }
 
-    /** Stethoscope is visible in the toolbar but disabled in this application. */
-    fun Stethoscope_Click() {
+    /** Shows the Stethoscope workflow when Android audio permission is available. */
+    suspend fun Stethoscope_Click() {
+        if (EnsureAudioPermission()) {
+            _stethoscopeView?.let { ShowView(it) }
+        } else {
+            MessageBox(
+                "Android microphone permission is required to use the Stethoscope.",
+                "Stethoscope Permission",
+                listOf(MessageBoxResult.OK)
+            )
+        }
     }
 
     /** Camera is visible in the toolbar but disabled in this application. */
@@ -585,12 +615,12 @@ private class MainWindow(private val activity: Activity) {
 
     /**
      * Recomputes toolbar state after a workflow requests navigation locking.
-     * Camera, Stethoscope, and Summary remain non-interactive.
+     * Camera and Summary remain non-interactive.
      */
     private fun CurrentSensorView_ViewLockStateChanged(locked: Boolean) {
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
-        ToolButtonStethoscopeEnabled = false
+        ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
         ToolButtonCameraEnabled = false
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
@@ -645,6 +675,18 @@ private class MainWindow(private val activity: Activity) {
                 "ecg" -> EnumSensor.Ecg
                 else -> null
             }
+    }
+
+    /** Requests Android microphone access before opening the Stethoscope workflow. */
+    private suspend fun EnsureAudioPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) return true
+
+        val launcher = _audioPermissionLauncher ?: return false
+        val result = CompletableDeferred<Boolean>()
+        _audioPermissionResult = result
+        launcher.launch(Manifest.permission.RECORD_AUDIO)
+        return result.await()
     }
 
     /**
@@ -1111,6 +1153,132 @@ private class PulseOximeterViewModel(
     }
 }
 
+
+/** Stethoscope workflow: choose a mode, record, and save captured WAV output. */
+private class StethoscopeView(
+    private val _controller: MedWandController,
+    private val _capturesFile: File,
+    private val _setLocked: (Boolean) -> Unit
+) : ISensorView {
+    private var _previousRecordedFramesHandler: ((ByteArray) -> Unit)? = null
+    private var _captured = 0
+    private var _isActivated = false
+
+    override val MedWandSensor: EnumSensor = EnumSensor.Stethoscope
+    override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
+
+    var StatusMessage by mutableStateOf("Off : Ready [0 Captured]")
+    var ButtonActionState by mutableStateOf(ActionState.Idle)
+    var ButtonActionText by mutableStateOf("Start Recording")
+    var StethoscopeMode by mutableStateOf(StethoscopeHelpers.MicrophoneModes.Off)
+
+    override fun Activate() {
+        if (!_isActivated) {
+            _isActivated = true
+            _controller.stethoscope?.let { stethoscope ->
+                _previousRecordedFramesHandler = stethoscope.onRecordedFramesReady
+                stethoscope.onRecordedFramesReady = { bytes ->
+                    _previousRecordedFramesHandler?.invoke(bytes)
+                    OnRecordedFramesReady(bytes)
+                }
+            }
+        }
+        SetAction(ActionState.Idle)
+        UpdateStatus()
+    }
+
+    override fun Deactivate() {
+        if (ButtonActionState == ActionState.Busy) StopCapture()
+        SetStethoscopeMode(StethoscopeHelpers.MicrophoneModes.Off)
+        _controller.stethoscope?.onRecordedFramesReady = _previousRecordedFramesHandler
+        _previousRecordedFramesHandler = null
+        _isActivated = false
+    }
+
+    override fun OnReadingStateChanged(readingState: EnumReadingState) = UpdateStatus()
+    override fun OnReadingReceived(reading: MedWandReading) = Unit
+    override fun OnDeviceError(error: MedWandDeviceError?) = SetAction(if (error == null) ActionState.Idle else ActionState.Disabled)
+
+    fun SetStethoscopeMode(mode: StethoscopeHelpers.MicrophoneModes) {
+        if (ButtonActionState == ActionState.Busy) StopCapture()
+        runCatching { _controller.setStethoscopeMode(mode) }
+            .onFailure { println(it.message) }
+        StethoscopeMode = _controller.stethoscopeMode
+        UpdateStatus()
+    }
+
+    fun OnActionButtonClick() {
+        when (ButtonActionState) {
+            ActionState.Idle -> StartCapture()
+            ActionState.Busy -> StopCapture()
+            ActionState.Disabled -> Unit
+        }
+    }
+
+    private fun StartCapture() {
+        if (_controller.stethoscopeMode == StethoscopeHelpers.MicrophoneModes.Off) {
+            StatusMessage = "Select Heart, Lungs, or Bowel before recording."
+            return
+        }
+
+        SetAction(ActionState.Disabled)
+        runCatching { _controller.startRecording() }
+            .onSuccess {
+                SetAction(if (_controller.stethoscope?.isRecording == true) ActionState.Busy else ActionState.Idle)
+            }
+            .onFailure {
+                println(it.message)
+                SetAction(ActionState.Idle)
+            }
+    }
+
+    private fun StopCapture() {
+        SetAction(ActionState.Disabled)
+        runCatching { _controller.stopRecording() }
+            .onFailure { println(it.message) }
+        SetAction(ActionState.Idle)
+    }
+
+    private fun SetAction(actionState: ActionState) {
+        ButtonActionState = actionState
+        ButtonActionText = when (actionState) {
+            ActionState.Idle -> "Start Recording"
+            ActionState.Busy -> "Stop Recording"
+            ActionState.Disabled -> ""
+        }
+        _setLocked(actionState == ActionState.Busy)
+        UpdateStatus()
+    }
+
+    private fun UpdateStatus() {
+        val readingState = when (_controller.readingState) {
+            EnumReadingState.Stopped -> "Ready"
+            EnumReadingState.Starting,
+            EnumReadingState.Started,
+            EnumReadingState.Reading -> "On"
+            else -> _controller.readingState.toString()
+        }
+        StatusMessage = "${_controller.stethoscopeMode} : $readingState [$_captured Captured]"
+    }
+
+    private fun OnRecordedFramesReady(bytes: ByteArray) {
+        runCatching {
+            _capturesFile.appendText(
+                "[${Instant.now()}] ${_controller.stethoscopeModel} ${_controller.stethoscopeMode} -> ${bytes.size}\n"
+            )
+            _captured++
+            UpdateStatus()
+        }.onFailure { println(it.message) }
+    }
+
+    override fun close() = Deactivate()
+
+    @Composable
+    override fun Render() {
+        StethoscopeView(this)
+    }
+}
+
 /**
  * SDK render target used as the ECG content container. The SDK supplies image
  * bytes through render(), and Compose displays the latest decoded frame.
@@ -1564,7 +1732,7 @@ private fun ToolBar(MainWindow: MainWindow) {
                 resourceId = R.drawable.stethoscope_hover,
                 enabled = MainWindow.ToolButtonStethoscopeEnabled,
                 scale = toolbarScale,
-                onClick = MainWindow::Stethoscope_Click
+                onClick = { coroutineScope.launch { MainWindow.Stethoscope_Click() } }
             )
             ImageOnlyButton(
                 resourceId = R.drawable.camera_hover,
@@ -1824,6 +1992,100 @@ private fun PulseOximeterView(_viewModel: PulseOximeterViewModel) {
                 fontSize = 16.sp
             )
         }
+    }
+}
+
+
+/** Stethoscope content region with mode buttons, status, and recording action. */
+@Composable
+private fun StethoscopeView(view: StethoscopeView) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .background(HighlightBrush),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                text = "Stethoscope",
+                color = ButtonHighlightBrush,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 10.dp)
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(ControlDarkDarkBrush)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = "Mode",
+                color = ControlTextHighlightBrush,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                StethoscopeModeButton("Off", StethoscopeHelpers.MicrophoneModes.Off, view)
+                StethoscopeModeButton("Heart", StethoscopeHelpers.MicrophoneModes.Heart, view)
+                StethoscopeModeButton("Lungs", StethoscopeHelpers.MicrophoneModes.Lungs, view)
+                StethoscopeModeButton("Bowel", StethoscopeHelpers.MicrophoneModes.Bowel, view)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .background(ButtonFaceBrush),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(text = view.StatusMessage, color = ControlTextBrush, fontSize = 16.sp)
+        }
+
+        Button(
+            onClick = view::OnActionButtonClick,
+            enabled = view.ButtonActionState != ActionState.Disabled,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = when (view.ButtonActionState) {
+                    ActionState.Idle -> ActionButtonIdle
+                    ActionState.Busy -> ActionButtonBusy
+                    ActionState.Disabled -> ActionButtonDisabled
+                },
+                disabledContainerColor = ActionButtonDisabled
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+        ) {
+            Text(text = view.ButtonActionText, color = Color.White, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun StethoscopeModeButton(
+    label: String,
+    mode: StethoscopeHelpers.MicrophoneModes,
+    view: StethoscopeView
+) {
+    Button(
+        onClick = { view.SetStethoscopeMode(mode) },
+        enabled = view.ButtonActionState != ActionState.Disabled,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (view.StethoscopeMode == mode) ButtonFaceBrush else ControlBrush,
+            contentColor = ControlTextBrush,
+            disabledContainerColor = ActionButtonDisabled
+        )
+    ) {
+        Text(text = label, fontSize = 14.sp)
     }
 }
 
