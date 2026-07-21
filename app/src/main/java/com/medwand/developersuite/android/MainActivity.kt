@@ -5,6 +5,9 @@ import android.app.Activity
 import android.app.PendingIntent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -17,14 +20,17 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.view.View
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -38,16 +44,21 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,18 +74,30 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import com.medwand.developersuite.android.BuildConfig
 import com.medwand.sdk_core.Core.EnumReadingState
 import com.medwand.sdk_core.Core.EnumSensor
 import com.medwand.sdk_core.Core.MedWandDeviceError
 import com.medwand.sdk_core.Core.MedWandReading
+import com.medwand.sdk_core.Internal.CameraHelper
 import com.medwand.sdk_core.Internal.StethoscopeHelpers
 import com.medwand.sdk_core.MedWandController
+import com.medwand.sdk_core.Modules.CameraPreviewTarget
 import com.medwand.sdk_core.Modules.EcgRenderTarget
+import com.medwand.sdk_core.Modules.UvcCameraPreviewTarget
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import java.time.Instant
+import kotlin.math.roundToInt
 import kotlin.system.exitProcess
 
 /**
@@ -123,7 +146,7 @@ private object Settings {
 private const val ACTION_USB_PERMISSION = "com.medwand.developersuite.android.USB_PERMISSION"
 
 private const val StartupNoticeMessage =
-    "This is a BETA only sample application and SDK. This is not intended for use in production and should only be used for initial development work. The Camera is not functional in this version. You will still need to request a license through your sales representative."
+    "This is a BETA only sample application and SDK. This is not intended for use in production and should only be used for initial development work. Camera testing requires Android camera permission. You will still need to request a license through your sales representative."
 
 /**
  * Shared action state for workflow buttons and navigation locking.
@@ -194,6 +217,7 @@ private class MainWindow(private val activity: Activity) {
     private var _thermometerView: ThermometerView? = null
     private var _pulseOximeterView: PulseOximeterView? = null
     private var _stethoscopeView: StethoscopeView? = null
+    private var _cameraView: CameraView? = null
     private var _ecgView: EcgView? = null
     private var _currentSensorView: ISensorView? by mutableStateOf(null)
 
@@ -204,6 +228,15 @@ private class MainWindow(private val activity: Activity) {
         ) { granted ->
             _audioPermissionResult?.complete(granted)
             _audioPermissionResult = null
+        }
+
+    private var _cameraPermissionResult: CompletableDeferred<Boolean>? = null
+    private val _cameraPermissionLauncher: ActivityResultLauncher<String>? =
+        (activity as? ComponentActivity)?.registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            _cameraPermissionResult?.complete(granted)
+            _cameraPermissionResult = null
         }
 
     private val GeneralStatus: String
@@ -433,6 +466,12 @@ private class MainWindow(private val activity: Activity) {
             File(activity.filesDir, "captures.txt"),
             { CurrentSensorView_ViewLockStateChanged(locked = it) }
         )
+        _cameraView = CameraView(
+            requireNotNull(_medWandController),
+            activity,
+            File(activity.filesDir, "camera-captures"),
+            { CurrentSensorView_ViewLockStateChanged(locked = it) }
+        )
         _ecgView = EcgView(
             requireNotNull(_medWandController),
             capturesFile = File(activity.filesDir, "captures.txt"),
@@ -447,8 +486,8 @@ private class MainWindow(private val activity: Activity) {
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
         ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
-        // Camera is shown in the toolbar but disabled in this application.
-        ToolButtonCameraEnabled = false
+        ToolButtonCameraEnabled =
+            _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
         ToolButtonExitEnabled = true
@@ -490,13 +529,14 @@ private class MainWindow(private val activity: Activity) {
     }
 
     /**
-     * Updates toolbar enabled state while preserving the disabled Camera affordance.
+     * Updates toolbar enabled state for the currently licensed and connected workflows.
      */
     private fun SetNavigation(enabled: Boolean, exitEnabled: Boolean) {
         ToolButtonThermometerEnabled = enabled
         ToolButtonPulseOximeterEnabled = enabled
         ToolButtonStethoscopeEnabled = enabled && _medWandController?.hasValidStethoscope == true
-        ToolButtonCameraEnabled = false
+        ToolButtonCameraEnabled = enabled &&
+                _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
         ToolButtonEcgEnabled = enabled && _medWandController?.hasValidEcg == true
         ToolButtonSummaryEnabled = enabled
         ToolButtonExitEnabled = exitEnabled
@@ -540,10 +580,12 @@ private class MainWindow(private val activity: Activity) {
         _thermometerView?.close()
         _pulseOximeterView?.close()
         _stethoscopeView?.close()
+        _cameraView?.close()
         _ecgView?.close()
         _thermometerView = null
         _pulseOximeterView = null
         _stethoscopeView = null
+        _cameraView = null
         _ecgView = null
 
         // StopSensor is called during cleanup so any currently active sensor is
@@ -581,8 +623,17 @@ private class MainWindow(private val activity: Activity) {
         }
     }
 
-    /** Camera is visible in the toolbar but disabled in this application. */
-    fun Camera_Click() {
+    /** Requests Android camera access, then opens the Camera workflow. */
+    suspend fun Camera_Click() {
+        if (EnsureCameraPermission()) {
+            _cameraView?.let { ShowView(it) }
+        } else {
+            MessageBox(
+                "Android camera permission is required to use the Otoscope and Dermatoscope.",
+                "Camera Permission",
+                listOf(MessageBoxResult.OK)
+            )
+        }
     }
 
     /** Shows the ECG workflow when the toolbar action is enabled. */
@@ -615,13 +666,14 @@ private class MainWindow(private val activity: Activity) {
 
     /**
      * Recomputes toolbar state after a workflow requests navigation locking.
-     * Camera and Summary remain non-interactive.
+     * Licensed sensor buttons remain available; Summary stays non-interactive.
      */
     private fun CurrentSensorView_ViewLockStateChanged(locked: Boolean) {
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
         ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
-        ToolButtonCameraEnabled = false
+        ToolButtonCameraEnabled =
+            _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
         ToolButtonExitEnabled = true
@@ -675,6 +727,18 @@ private class MainWindow(private val activity: Activity) {
                 "ecg" -> EnumSensor.Ecg
                 else -> null
             }
+    }
+
+    /** Requests Android camera access before opening the Camera workflow. */
+    private suspend fun EnsureCameraPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        if (activity.checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) return true
+
+        val launcher = _cameraPermissionLauncher ?: return false
+        val result = CompletableDeferred<Boolean>()
+        _cameraPermissionResult = result
+        launcher.launch(Manifest.permission.CAMERA)
+        return result.await()
     }
 
     /** Requests Android microphone access before opening the Stethoscope workflow. */
@@ -1279,6 +1343,495 @@ private class StethoscopeView(
     }
 }
 
+
+/**
+ * UVC preview target that preserves the SDK preview behavior while exposing
+ * the actual frame dimensions reported by the camera callback.
+ */
+private class SizedUvcCameraPreviewTarget(context: Context) : CameraPreviewTarget {
+    private val _delegate = UvcCameraPreviewTarget(context)
+
+    @Volatile
+    var FrameWidth: Int = 0
+        private set
+
+    @Volatile
+    var FrameHeight: Int = 0
+        private set
+
+    override fun resolveCameraDeviceInfo() = _delegate.resolveCameraDeviceInfo()
+
+    override fun resolveCameraModel() = _delegate.resolveCameraModel()
+
+    override fun setFocusMode(focusMode: CameraHelper.FocusModes) =
+        _delegate.setFocusMode(focusMode)
+
+    override fun setFocusModeValue(focusPercent: Int) =
+        _delegate.setFocusModeValue(focusPercent)
+
+    override fun start(
+        width: Int,
+        height: Int,
+        frameRate: Int,
+        onFrame: (ByteArray, Int, Int) -> Unit
+    ) {
+        FrameWidth = width
+        FrameHeight = height
+        _delegate.start(width, height, frameRate) { bytes, actualWidth, actualHeight ->
+            FrameWidth = actualWidth
+            FrameHeight = actualHeight
+            onFrame(bytes, actualWidth, actualHeight)
+        }
+    }
+
+    override fun stop() {
+        _delegate.stop()
+        FrameWidth = 0
+        FrameHeight = 0
+    }
+}
+
+/**
+ * Lightweight camera surface that copies the SDK's ARGB frame directly into a
+ * reusable Bitmap and draws it centered with aspect-ratio-preserving Fit.
+ */
+private class CameraPreviewSurface(context: Context) : View(context) {
+    private val _bitmapLock = Any()
+    private val _destination = RectF()
+    private val _paint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private var _bitmap: Bitmap? = null
+
+    init {
+        setBackgroundColor(android.graphics.Color.BLACK)
+    }
+
+    /**
+     * Copies the SDK frame into the reusable display bitmap
+     */
+    fun RenderFrame(frameBytes: ByteArray, frameWidth: Int, frameHeight: Int): Boolean {
+        if (frameWidth <= 0 || frameHeight <= 0) return false
+
+        val expectedByteCount = frameWidth.toLong() * frameHeight.toLong() * 4L
+        if (expectedByteCount <= 0L || expectedByteCount > Int.MAX_VALUE) return false
+        if (frameBytes.size < expectedByteCount.toInt()) return false
+
+        var isFirstFrame = false
+        synchronized(_bitmapLock) {
+            var bitmap = _bitmap
+            if (bitmap == null || bitmap.width != frameWidth || bitmap.height != frameHeight) {
+                bitmap?.recycle()
+                bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
+                _bitmap = bitmap
+                isFirstFrame = true
+            }
+
+            bitmap.copyPixelsFromBuffer(
+                ByteBuffer.wrap(frameBytes, 0, expectedByteCount.toInt())
+            )
+        }
+
+        postInvalidateOnAnimation()
+        return isFirstFrame
+    }
+
+    /** Releases the current display frame and returns the surface to black. */
+    fun Clear() {
+        synchronized(_bitmapLock) {
+            _bitmap?.recycle()
+            _bitmap = null
+        }
+        postInvalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+
+        synchronized(_bitmapLock) {
+            val bitmap = _bitmap ?: return
+            if (width <= 0 || height <= 0) return
+
+            val scale = minOf(
+                width.toFloat() / bitmap.width.toFloat(),
+                height.toFloat() / bitmap.height.toFloat()
+            )
+            val drawWidth = bitmap.width * scale
+            val drawHeight = bitmap.height * scale
+            val left = (width - drawWidth) / 2f
+            val top = (height - drawHeight) / 2f
+
+            _destination.set(left, top, left + drawWidth, top + drawHeight)
+            canvas.drawBitmap(bitmap, null, _destination, _paint)
+        }
+    }
+}
+
+
+/** Camera workflow with live Dermatoscope/Otoscope preview and still capture. */
+private class CameraView(
+    private val _controller: MedWandController,
+    private val _activity: Activity,
+    private val _capturesDirectory: File,
+    private val _setLocked: (Boolean) -> Unit
+) : ISensorView {
+    private val _scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var _previewJob: Job? = null
+    private var _previewTarget: SizedUvcCameraPreviewTarget? = null
+    private var _previewSurface: CameraPreviewSurface? = null
+    private var _previousRecordedFrameHandler: ((ByteArray) -> Unit)? = null
+    private var _previousLedIntensityHandler: ((Int) -> Unit)? = null
+    private var _isActivated = false
+    private var _previewSession = 0L
+
+    override val MedWandSensor: EnumSensor = EnumSensor.Otoscope
+    override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
+
+    var HasFrame by mutableStateOf(false)
+    var CameraMode by mutableStateOf(CameraHelper.CameraModes.Off)
+    var StatusMessage by mutableStateOf("Off : Ready [0 Captured]")
+    var CapturedCount by mutableStateOf(0)
+    var IsStarting by mutableStateOf(false)
+    var LedIntensity by mutableStateOf(0)
+    var LedIntensityMax by mutableStateOf(0)
+    var LedControlAvailable by mutableStateOf(false)
+    var LedIntensityAdjustable by mutableStateOf(false)
+    var FocusValue by mutableStateOf(0)
+    var FocusValueMax by mutableStateOf(0)
+    var ManualFocusEnabled by mutableStateOf(false)
+    var AutoFocusAvailable by mutableStateOf(false)
+    var ManualFocusAvailable by mutableStateOf(false)
+    var FocusControlAvailable by mutableStateOf(false)
+
+    override fun Activate() {
+        if (!_isActivated) {
+            _isActivated = true
+            _controller.camera?.let { camera ->
+                _previousRecordedFrameHandler = camera.onRecordedFrameReady
+                camera.onRecordedFrameReady = { bytes ->
+                    _previousRecordedFrameHandler?.invoke(bytes)
+                    OnRecordedFrameReady(bytes)
+                }
+            }
+            _previousLedIntensityHandler = _controller.onLedIntensityChanged
+            _controller.onLedIntensityChanged = { intensity ->
+                _previousLedIntensityHandler?.invoke(intensity)
+                _activity.runOnUiThread {
+                    LedIntensity = intensity.coerceIn(0, LedIntensityMax.coerceAtLeast(0))
+                }
+            }
+            _controller.setCameraFrameHandler { frameBytes -> OnFrameReady(frameBytes) }
+        }
+
+        CameraMode = _controller.cameraMode
+        if (_controller.cameraIsMonitoring) UpdateCameraControls() else ResetCameraControls()
+        UpdateStatus(if (_controller.cameraIsMonitoring) "On" else "Ready")
+    }
+
+    override fun Deactivate() {
+        _isActivated = false
+        _previewSession++
+        _previewJob?.cancel()
+        _previewJob = null
+        IsStarting = false
+        _setLocked(false)
+
+        runCatching { _controller.stopSensor(false) }
+            .onFailure { println(it.message) }
+
+        _controller.setCameraFrameHandler(null)
+        _controller.camera?.onRecordedFrameReady = _previousRecordedFrameHandler
+        _previousRecordedFrameHandler = null
+        _controller.onLedIntensityChanged = _previousLedIntensityHandler
+        _previousLedIntensityHandler = null
+        _previewTarget = null
+        _previewSurface?.Clear()
+        CameraMode = CameraHelper.CameraModes.Off
+        HasFrame = false
+        ResetCameraControls()
+        UpdateStatus("Ready")
+    }
+
+    override fun OnReadingStateChanged(readingState: EnumReadingState) {
+        if (CameraMode != CameraHelper.CameraModes.Off) {
+            UpdateStatus(if (_controller.cameraIsMonitoring) "On" else readingState.toString())
+        }
+    }
+
+    override fun OnReadingReceived(reading: MedWandReading) = Unit
+
+    override fun OnDeviceError(error: MedWandDeviceError?) {
+        if (error != null) {
+            StatusMessage = "${CameraMode.displayName()} : Error - ${error.exception.message ?: error.errorCode.toString()} [$CapturedCount Captured]"
+        }
+    }
+
+    fun SelectMode(mode: CameraHelper.CameraModes) {
+        if (!_isActivated || IsStarting) return
+        if (mode == CameraHelper.CameraModes.Off) {
+            StopPreview()
+        } else {
+            StartPreview(mode)
+        }
+    }
+
+    fun Capture() {
+        if (!_controller.cameraIsMonitoring || IsStarting) return
+        runCatching { _controller.camera?.recordFrame() }
+            .onFailure {
+                StatusMessage = "${CameraMode.displayName()} : Capture failed - ${it.message.orEmpty()} [$CapturedCount Captured]"
+            }
+    }
+
+    fun SetLedIntensity(value: Int) {
+        if (!LedControlAvailable || !_controller.cameraIsMonitoring || LedIntensityMax <= 0) return
+        val target = if (LedIntensityAdjustable) {
+            value.coerceIn(0, LedIntensityMax)
+        } else {
+            if (value > 0) LedIntensityMax else 0
+        }
+        RunControl("LED") { _controller.setCameraLedIntensity(target) }
+    }
+
+    fun ToggleLed() {
+        SetLedIntensity(if (LedIntensity > 0) 0 else LedIntensityMax)
+    }
+
+    fun SetManualFocus(enabled: Boolean) {
+        if (!_controller.cameraIsMonitoring) return
+        if (enabled && !ManualFocusAvailable) return
+        if (!enabled && !AutoFocusAvailable) return
+
+        RunControl("focus mode") {
+            _controller.setFocusMode(
+                if (enabled) CameraHelper.FocusModes.Manual else CameraHelper.FocusModes.Auto,
+                resetLastValue = false
+            )
+        }
+    }
+
+    fun SetFocusValue(value: Int) {
+        if (!ManualFocusAvailable || !ManualFocusEnabled || FocusValueMax <= 0) return
+        val target = value.coerceIn(0, FocusValueMax)
+        RunControl("manual focus") { _controller.setFocusModeValue(target) }
+    }
+
+    fun MoveOtoscope(horizontal: Int? = null, vertical: Int? = null) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
+        runCatching {
+            _controller.cameraMove(horizontal?.times(MOVE_STEP), vertical?.times(MOVE_STEP))
+        }.onFailure { ShowControlError("move", it) }
+    }
+
+    fun ChangeOtoscopeRadius(increment: Int) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
+        runCatching { _controller.cameraAdjustOtoscopeRadius(increment * RADIUS_STEP) }
+            .onFailure { ShowControlError("circle size", it) }
+    }
+
+    fun ZoomOtoscope(increment: Int) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
+        runCatching { _controller.cameraZoom(increment * ZOOM_STEP) }
+            .onFailure { ShowControlError("zoom", it) }
+    }
+
+    private fun RunControl(name: String, update: suspend () -> Boolean) {
+        _scope.launch {
+            val updated = runCatching { withContext(Dispatchers.IO) { update() } }
+                .getOrElse { error ->
+                    ShowControlError(name, error)
+                    false
+                }
+            if (updated) UpdateCameraControls()
+        }
+    }
+
+    private fun UpdateCameraControls() {
+        LedIntensityMax = _controller.cameraLedIntensityMax.coerceAtLeast(0)
+        LedIntensity = _controller.ledIntensity.coerceIn(0, LedIntensityMax)
+        LedIntensityAdjustable = _controller.cameraLedIntensityAdjustable
+        LedControlAvailable = _controller.cameraIsMonitoring && LedIntensityMax > 0
+
+        val focusInfo = _controller.cameraFocusInfo
+        FocusValueMax = focusInfo?.focusMaximum?.coerceAtLeast(0) ?: 0
+        FocusValue = _controller.cameraFocusModeValue.coerceIn(0, FocusValueMax)
+        AutoFocusAvailable = focusInfo?.hasAutoFocus == true
+        ManualFocusAvailable = focusInfo?.hasManualFocus == true && FocusValueMax > 0
+        FocusControlAvailable = _controller.cameraIsMonitoring &&
+                (AutoFocusAvailable || ManualFocusAvailable)
+        ManualFocusEnabled =
+            ManualFocusAvailable && _controller.cameraFocusMode == CameraHelper.FocusModes.Manual
+    }
+
+    private fun ResetCameraControls() {
+        LedIntensity = 0
+        LedIntensityMax = 0
+        LedControlAvailable = false
+        LedIntensityAdjustable = false
+        FocusValue = 0
+        FocusValueMax = 0
+        ManualFocusEnabled = false
+        AutoFocusAvailable = false
+        ManualFocusAvailable = false
+        FocusControlAvailable = false
+    }
+
+    private fun ShowControlError(name: String, error: Throwable) {
+        StatusMessage = "${CameraMode.displayName()} : $name failed - ${error.message.orEmpty()} [$CapturedCount Captured]"
+    }
+
+    fun AttachPreviewSurface(surface: CameraPreviewSurface) {
+        _previewSurface = surface
+        if (!HasFrame) surface.Clear()
+    }
+
+    fun DetachPreviewSurface(surface: CameraPreviewSurface) {
+        if (_previewSurface === surface) {
+            _previewSurface = null
+        }
+        surface.Clear()
+    }
+
+    private fun StartPreview(mode: CameraHelper.CameraModes) {
+        val session = ++_previewSession
+        _previewJob?.cancel()
+        HasFrame = false
+        _previewSurface?.Clear()
+        IsStarting = true
+        CameraMode = mode
+        UpdateStatus("Starting")
+        _setLocked(true)
+
+        _previewJob = _scope.launch {
+            val target = SizedUvcCameraPreviewTarget(_activity)
+            _previewTarget = target
+            val started = runCatching {
+                withContext(Dispatchers.IO) {
+                    _controller.setCameraMode(target, mode)
+                }
+            }.getOrElse { error ->
+                if (_isActivated && session == _previewSession) {
+                    StatusMessage = "${mode.displayName()} : Error - ${error.message.orEmpty()} [$CapturedCount Captured]"
+                }
+                false
+            }
+
+            if (!_isActivated || session != _previewSession) {
+                withContext(Dispatchers.IO) { runCatching { _controller.stopSensor(false) } }
+                return@launch
+            }
+
+            IsStarting = false
+            CameraMode = if (started) _controller.cameraMode else CameraHelper.CameraModes.Off
+            if (started) {
+                UpdateCameraControls()
+                if (AutoFocusAvailable) {
+                    withContext(Dispatchers.IO) {
+                        _controller.setFocusMode(CameraHelper.FocusModes.Auto, resetLastValue = false)
+                    }
+                    UpdateCameraControls()
+                }
+                UpdateStatus("On")
+            } else {
+                ResetCameraControls()
+                val detail = _controller.cameraLastError?.takeIf { it.isNotBlank() } ?: "Preview did not start"
+                StatusMessage = "${mode.displayName()} : Error - $detail [$CapturedCount Captured]"
+                _setLocked(false)
+            }
+        }
+    }
+
+    private fun StopPreview() {
+        val session = ++_previewSession
+        _previewJob?.cancel()
+        IsStarting = true
+        UpdateStatus("Stopping")
+
+        _previewJob = _scope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { _controller.stopSensor(false) }
+            }
+            if (!_isActivated || session != _previewSession) return@launch
+            IsStarting = false
+            CameraMode = CameraHelper.CameraModes.Off
+            HasFrame = false
+            _previewSurface?.Clear()
+            _previewTarget = null
+            ResetCameraControls()
+            _setLocked(false)
+            UpdateStatus("Ready")
+        }
+    }
+
+    private fun OnFrameReady(frameBytes: ByteArray) {
+        if (!_isActivated || !_controller.cameraIsMonitoring) return
+        val session = _previewSession
+        val target = _previewTarget ?: return
+        val surface = _previewSurface ?: return
+        val rendered = surface.RenderFrame(frameBytes, target.FrameWidth, target.FrameHeight)
+
+        if (rendered) {
+            _activity.runOnUiThread {
+                if (_isActivated && session == _previewSession && _controller.cameraIsMonitoring) {
+                    if (!HasFrame) UpdateCameraControls()
+                    HasFrame = true
+                }
+            }
+        }
+    }
+
+    private fun OnRecordedFrameReady(frameBytes: ByteArray) {
+        val modeAtCapture = CameraMode
+        _scope.launch(Dispatchers.Default) {
+            try {
+                val png = _controller.cameraPngFromFrame(frameBytes) ?: ByteArray(0)
+                if (png.isEmpty()) throw Exception("The SDK returned an empty camera frame.")
+
+                _capturesDirectory.mkdirs()
+                val file = File(
+                    _capturesDirectory,
+                    "${modeAtCapture.name.lowercase()}-${Instant.now().toEpochMilli()}.png"
+                )
+                file.writeBytes(png)
+
+                withContext(Dispatchers.Main.immediate) {
+                    CapturedCount++
+                    UpdateStatus(if (_controller.cameraIsMonitoring) "On" else "Ready")
+                }
+            } catch (error: Exception) {
+                withContext(Dispatchers.Main.immediate) {
+                    StatusMessage = "${modeAtCapture.displayName()} : Capture failed - ${error.message.orEmpty()} [$CapturedCount Captured]"
+                }
+            }
+        }
+    }
+
+    private fun UpdateStatus(state: String) {
+        StatusMessage = "${CameraMode.displayName()} : $state [$CapturedCount Captured]"
+    }
+
+    private companion object {
+        const val MOVE_STEP = 5
+        const val RADIUS_STEP = 10
+        const val ZOOM_STEP = 10
+    }
+
+    override fun close() {
+        Deactivate()
+        _scope.cancel()
+    }
+
+    @Composable
+    override fun Render() {
+        CameraView(this)
+    }
+}
+
+private fun CameraHelper.CameraModes.displayName(): String =
+    when (this) {
+        CameraHelper.CameraModes.Off -> "Off"
+        CameraHelper.CameraModes.Dermatoscope -> "Dermatoscope"
+        CameraHelper.CameraModes.Otoscope -> "Otoscope"
+    }
+
 /**
  * SDK render target used as the ECG content container. The SDK supplies image
  * bytes through render(), and Compose displays the latest decoded frame.
@@ -1738,7 +2291,7 @@ private fun ToolBar(MainWindow: MainWindow) {
                 resourceId = R.drawable.camera_hover,
                 enabled = MainWindow.ToolButtonCameraEnabled,
                 scale = toolbarScale,
-                onClick = MainWindow::Camera_Click
+                onClick = { coroutineScope.launch { MainWindow.Camera_Click() } }
             )
             ImageOnlyButton(
                 resourceId = R.drawable.ecg_hover,
@@ -2086,6 +2639,298 @@ private fun StethoscopeModeButton(
         )
     ) {
         Text(text = label, fontSize = 14.sp)
+    }
+}
+
+
+/** Camera content region closely matching the desktop Otoscope/Dermatoscope view. */
+@Composable
+private fun CameraView(view: CameraView) {
+    val context = LocalContext.current
+    val previewSurface = remember(context) { CameraPreviewSurface(context) }
+
+    DisposableEffect(view, previewSurface) {
+        view.AttachPreviewSurface(previewSurface)
+        onDispose {
+            view.DetachPreviewSurface(previewSurface)
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .background(HighlightBrush),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                text = "Camera",
+                color = ButtonHighlightBrush,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 10.dp)
+            )
+        }
+
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .background(Color.Black)
+        ) {
+            CameraControls(view)
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                AndroidView(
+                    factory = { previewSurface },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                if (!view.HasFrame) {
+                    Text(
+                        text = if (view.IsStarting) "Starting camera preview..." else "Select Dermatoscope or Otoscope",
+                        color = ControlDarkBrush,
+                        fontSize = 18.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(24.dp)
+                    )
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .width(118.dp)
+                    .fillMaxHeight()
+                    .background(ControlDarkBrush)
+                    .padding(horizontal = 7.dp, vertical = 7.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(30.dp)
+                        .background(HighlightBrush),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "Modes",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                }
+                Spacer(modifier = Modifier.height(7.dp))
+                CameraModeButton(CameraHelper.CameraModes.Off, view)
+                Spacer(modifier = Modifier.height(7.dp))
+                CameraModeButton(CameraHelper.CameraModes.Dermatoscope, view)
+                Spacer(modifier = Modifier.height(7.dp))
+                CameraModeButton(CameraHelper.CameraModes.Otoscope, view)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+                .background(ButtonFaceBrush),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = view.StatusMessage,
+                color = ControlTextBrush,
+                fontSize = 16.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 10.dp)
+            )
+        }
+
+        Button(
+            onClick = view::Capture,
+            enabled = !view.IsStarting && view.CameraMode != CameraHelper.CameraModes.Off && view.HasFrame,
+            shape = RectangleShape,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = ActionButtonIdle,
+                disabledContainerColor = ActionButtonDisabled
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp)
+        ) {
+            Text(text = "Capture", color = Color.White, fontSize = 16.sp)
+        }
+    }
+}
+
+@Composable
+private fun CameraControls(view: CameraView) {
+    val enabled = !view.IsStarting && view.CameraMode != CameraHelper.CameraModes.Off
+
+    Column(
+        modifier = Modifier
+            .width(150.dp)
+            .fillMaxHeight()
+            .background(ButtonFaceBrush)
+            .verticalScroll(rememberScrollState())
+            .padding(6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("Controls", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+        Spacer(Modifier.height(6.dp))
+
+        if (view.LedControlAvailable) {
+            Text("White LED: ${view.LedIntensity}", fontSize = 12.sp)
+            if (view.LedIntensityAdjustable) {
+                var ledSliderValue by remember(view.LedIntensity, view.LedIntensityMax) {
+                    mutableStateOf(view.LedIntensity.toFloat())
+                }
+                Slider(
+                    value = ledSliderValue,
+                    onValueChange = { ledSliderValue = it },
+                    onValueChangeFinished = {
+                        view.SetLedIntensity(ledSliderValue.roundToInt())
+                    },
+                    valueRange = 0f..view.LedIntensityMax.coerceAtLeast(1).toFloat(),
+                    enabled = enabled,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                CameraControlButton(if (view.LedIntensity > 0) "Turn off" else "Turn on", enabled) {
+                    view.ToggleLed()
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        if (view.FocusControlAvailable) {
+            Text("Focus: ${if (view.ManualFocusEnabled) "Manual" else "Auto"}", fontSize = 12.sp)
+
+            if (view.AutoFocusAvailable && view.ManualFocusAvailable) {
+                CameraControlButton(
+                    if (view.ManualFocusEnabled) "Use Auto" else "Use Manual",
+                    enabled
+                ) {
+                    view.SetManualFocus(!view.ManualFocusEnabled)
+                }
+            } else if (view.AutoFocusAvailable) {
+                Text("Auto focus", fontSize = 11.sp)
+            }
+
+            if (view.ManualFocusAvailable) {
+                var focusSliderValue by remember(view.FocusValue, view.FocusValueMax) {
+                    mutableStateOf(view.FocusValue.toFloat())
+                }
+                Text("Manual value: ${focusSliderValue.roundToInt()}", fontSize = 11.sp)
+                Slider(
+                    value = focusSliderValue,
+                    onValueChange = { focusSliderValue = it },
+                    onValueChangeFinished = {
+                        view.SetFocusValue(focusSliderValue.roundToInt())
+                    },
+                    valueRange = 0f..view.FocusValueMax.coerceAtLeast(1).toFloat(),
+                    enabled = enabled && view.ManualFocusEnabled,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        if (view.CameraMode == CameraHelper.CameraModes.Otoscope) {
+            Text("Move", fontSize = 12.sp)
+            CameraControlButton("↑", enabled) { view.MoveOtoscope(vertical = -1) }
+            Row {
+                CameraControlButton("←", enabled) { view.MoveOtoscope(horizontal = -1) }
+                Spacer(Modifier.width(4.dp))
+                CameraControlButton("→", enabled) { view.MoveOtoscope(horizontal = 1) }
+            }
+            CameraControlButton("↓", enabled) { view.MoveOtoscope(vertical = 1) }
+            Spacer(Modifier.height(6.dp))
+            Text("Circle", fontSize = 12.sp)
+            Row {
+                CameraControlButton("−", enabled) { view.ChangeOtoscopeRadius(-1) }
+                Spacer(Modifier.width(4.dp))
+                CameraControlButton("+", enabled) { view.ChangeOtoscopeRadius(1) }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text("Zoom", fontSize = 12.sp)
+            Row {
+                CameraControlButton("−", enabled) { view.ZoomOtoscope(-1) }
+                Spacer(Modifier.width(4.dp))
+                CameraControlButton("+", enabled) { view.ZoomOtoscope(1) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CameraControlButton(label: String, enabled: Boolean, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RectangleShape,
+        contentPadding = PaddingValues(horizontal = 7.dp, vertical = 0.dp),
+        modifier = Modifier.height(30.dp)
+    ) {
+        Text(label, fontSize = 11.sp, maxLines = 1)
+    }
+}
+
+@Composable
+private fun CameraModeButton(mode: CameraHelper.CameraModes, view: CameraView) {
+    val selected = view.CameraMode == mode
+    Button(
+        onClick = { view.SelectMode(mode) },
+        enabled = !view.IsStarting,
+        shape = RectangleShape,
+        contentPadding = PaddingValues(4.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Color.White,
+            contentColor = HighlightBrush,
+            disabledContainerColor = Color(0xFFE5E5E5),
+            disabledContentColor = ControlDarkDarkBrush
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(91.dp)
+            .border(
+                width = if (selected) 2.dp else 1.dp,
+                color = if (selected) Color.Red else Color.White
+            )
+    ) {
+        val iconResource = when (mode) {
+            CameraHelper.CameraModes.Off -> R.drawable.none_hover
+            CameraHelper.CameraModes.Dermatoscope -> R.drawable.dermatoscope_hover
+            CameraHelper.CameraModes.Otoscope -> R.drawable.otoscope_hover
+        }
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Image(
+                painter = painterResource(iconResource),
+                contentDescription = "${mode.displayName()} camera mode",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .width(56.dp)
+                    .height(46.dp)
+            )
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = mode.displayName(),
+                color = ControlTextBrush,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 1
+            )
+        }
     }
 }
 
