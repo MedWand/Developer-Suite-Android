@@ -3,24 +3,18 @@ package com.medwand.developersuite.android
 import android.Manifest
 import android.app.Activity
 import android.app.PendingIntent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.RectF
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.os.Process
-import android.view.View
+import android.widget.ImageView
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
@@ -50,6 +44,7 @@ import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -64,10 +59,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -76,16 +69,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.medwand.developersuite.android.BuildConfig
-import com.medwand.sdk_core.Core.EnumReadingState
-import com.medwand.sdk_core.Core.EnumSensor
-import com.medwand.sdk_core.Core.MedWandDeviceError
-import com.medwand.sdk_core.Core.MedWandReading
+import com.medwand.sdk_core.ReadingState
+import com.medwand.sdk_core.MedWandSensor
+import com.medwand.sdk_core.MedWandDeviceError
+import com.medwand.sdk_core.MedWandReading
 import com.medwand.sdk_core.Internal.CameraHelper
 import com.medwand.sdk_core.Internal.StethoscopeHelpers
+import com.medwand.sdk_core.FirmwareController
+import com.medwand.sdk_core.Core.MedWandFirmwareUpdateRequiredException
 import com.medwand.sdk_core.MedWandController
-import com.medwand.sdk_core.Modules.CameraPreviewTarget
-import com.medwand.sdk_core.Modules.EcgRenderTarget
-import com.medwand.sdk_core.Modules.UvcCameraPreviewTarget
+import com.medwand.sdk_core.UpdaterState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -95,8 +88,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.nio.ByteBuffer
 import java.time.Instant
+import java.util.Base64
 import kotlin.math.roundToInt
 import kotlin.system.exitProcess
 
@@ -163,7 +156,7 @@ private enum class ActionState {
  */
 private interface ISensorView : AutoCloseable {
     /** SDK sensor represented by this workflow. */
-    val MedWandSensor: EnumSensor
+    val MedWandSensor: MedWandSensor
 
     /** Callback used by workflow state changes to lock or unlock navigation. */
     var ViewLockStateChanged: ((Boolean) -> Unit)?
@@ -175,7 +168,7 @@ private interface ISensorView : AutoCloseable {
     fun Deactivate()
 
     /** Receives the SDK reading-state changes routed by the shell. */
-    fun OnReadingStateChanged(readingState: EnumReadingState)
+    fun OnReadingStateChanged(readingState: ReadingState)
 
     /** Receives SDK readings for this workflow's sensor type. */
     fun OnReadingReceived(reading: MedWandReading)
@@ -196,6 +189,8 @@ private sealed class MessageBoxResult {
     data object Cancel : MessageBoxResult()
     data object Yes : MessageBoxResult()
     data object No : MessageBoxResult()
+    data object StartFirmwareUpdate : MessageBoxResult()
+    data object Exit : MessageBoxResult()
 }
 
 /**
@@ -206,6 +201,12 @@ private data class MessageBoxRequest(
     val title: String,
     val buttons: List<MessageBoxResult>,
     val result: CompletableDeferred<MessageBoxResult>
+)
+
+private data class FirmwareUpdateRequest(
+    val currentVersion: String,
+    val targetVersion: String,
+    val recovery: Boolean
 )
 
 /**
@@ -240,7 +241,7 @@ private class MainWindow(private val activity: Activity) {
         }
 
     private val GeneralStatus: String
-        get() = "Device: ${_medWandController?.comPort}/${_medWandController?.vendorId}/${_medWandController?.productId} | ${_medWandController?.udi} | ${_medWandController?.generation} v${_medWandController?.firmwareVersion}"
+        get() = "Device: ${_medWandController?.ComPort}/${_medWandController?.VendorId}/${_medWandController?.ProductId} | ${_medWandController?.Udi} | ${_medWandController?.Generation} v${_medWandController?.FirmwareVersion}"
 
     var ToolButtonThermometerEnabled by mutableStateOf(true)
     var ToolButtonPulseOximeterEnabled by mutableStateOf(true)
@@ -253,6 +254,10 @@ private class MainWindow(private val activity: Activity) {
     var PlaceholderInfo by mutableStateOf("Starting...")
     var MessageBox by mutableStateOf<MessageBoxRequest?>(null)
     var StartupNoticeAccepted by mutableStateOf(false)
+    var FirmwareUpdateVisible by mutableStateOf(false)
+    var FirmwareUpdateState by mutableStateOf("")
+    var FirmwareUpdateProgress by mutableStateOf(0)
+    var FirmwareUpdateMessage by mutableStateOf("")
 
     init {
         // Startup disables sensor navigation until the controller is connected
@@ -285,7 +290,8 @@ private class MainWindow(private val activity: Activity) {
      * the SDK controller, then create the available workflow views.
      */
     private suspend fun Initialize() {
-        ConnectMedWand()
+        val firmwareUpdate = ConnectMedWand()
+        if (firmwareUpdate != null && !CheckFirmwareUpdate(firmwareUpdate)) return
         InitializeMedWand()
         InitializeUserInterface()
     }
@@ -294,25 +300,22 @@ private class MainWindow(private val activity: Activity) {
      * Constructs the SDK controller, validates license inputs, requests Android
      * USB access when needed, and connects to the physical MedWand device.
      */
-    private suspend fun ConnectMedWand() {
+    private suspend fun ConnectMedWand(): FirmwareUpdateRequest? {
         if (Settings.MwSdkLicense.isEmpty() || Settings.MwSdkPublicKey.isEmpty()) {
             throw Exception("No valid license information")
         }
 
         val usbManager = activity.getSystemService(Activity.USB_SERVICE) as UsbManager
-        _medWandController = _medWandController ?: MedWandController(usbManager)
-        _medWandController?.onLicenseError = { state ->
+        _medWandController = _medWandController ?: MedWandController(activity.applicationContext)
+        _medWandController?.OnLicenseError = { state ->
             println("LicenseError: $state")
         }
-        // Builds the SDK controller license state before any connection attempt.
-        _medWandController?.construct(Settings.MwSdkLicense, Settings.MwSdkPublicKey)
-        if (_medWandController?.isLicenseValid != true) {
+        _medWandController?.Construct(Settings.MwSdkLicense, Settings.MwSdkPublicKey)
+        if (_medWandController?.IsLicenseValid != true) {
             throw Exception("No valid license")
         }
 
         UpdateStatus("Connecting to MedWand.")
-        // Android requires explicit USB permission before the SDK can open the
-        // attached USB device during connect().
         if (!RequestMedWandUsbPermission(usbManager)) {
             throw Exception("MedWand USB permission denied.")
         }
@@ -320,44 +323,57 @@ private class MainWindow(private val activity: Activity) {
         var done = false
         do {
             try {
-                // Direct SDK connection attempt; retry/cancel is driven by the
-                // visible message-box result when the controller is not connected.
-                _medWandController?.connect()
-                if (_medWandController?.isConnected != true) {
-                    val resultDialog = MessageBox(
-                        "MedWand not found. PLease connect your MedWand and try again.",
-                        "MedWand Not Found",
-                        listOf(MessageBoxResult.OK, MessageBoxResult.Cancel)
-                    )
-                    if (resultDialog == MessageBoxResult.Cancel) {
-                        break
-                    }
-                } else {
-                    done = true
-                }
+                _medWandController?.Connect()
+            } catch (updateRequired: MedWandFirmwareUpdateRequiredException) {
+                return FirmwareUpdateRequest(
+                    currentVersion = updateRequired.CurrentVersion,
+                    targetVersion = updateRequired.RequiredVersion,
+                    recovery = false
+                )
             } catch (outerEx: Exception) {
                 println(outerEx)
+            }
+
+            if (_medWandController?.IsConnected == true) {
+                done = true
+            } else if (FindMedWandUsbDevice(usbManager) != null) {
+                return FirmwareUpdateRequest(
+                    currentVersion = "Unavailable",
+                    targetVersion = "Latest available",
+                    recovery = true
+                )
+            } else {
+                val resultDialog = MessageBox(
+                    "MedWand not found. Please connect your MedWand and try again.",
+                    "MedWand Not Found",
+                    listOf(MessageBoxResult.OK, MessageBoxResult.Cancel)
+                )
+                if (resultDialog == MessageBoxResult.Cancel) {
+                    break
+                }
             }
         } while (!done)
 
         if (done) {
-            // Device and state callbacks are only attached after a successful
-            // connection so they route real SDK events into the active workflow.
-            _medWandController?.onDeviceError = { MedWandController_MedWandDeviceError(it) }
-            _medWandController?.onDeviceStateChanged = { MedWandController_DeviceStateChanged() }
-        } else {
-            _medWandController?.onLicenseError = {}
-            _medWandController = null
-            throw Exception("No MedWand Connected!")
+            _medWandController?.OnDeviceError = { MedWandController_MedWandDeviceError(it) }
+            _medWandController?.OnDeviceStateChanged = { MedWandController_DeviceStateChanged() }
+            return null
         }
+
+        _medWandController?.OnLicenseError = {}
+        _medWandController = null
+        throw Exception("No MedWand Connected!")
     }
 
     /**
      * Requests runtime permission for the discovered MedWand USB device and
      * suspends until Android broadcasts the grant or denial.
      */
-    private suspend fun RequestMedWandUsbPermission(usbManager: UsbManager): Boolean {
-        val medWandDevice = FindMedWandUsbDevice(usbManager) ?: return true
+    private suspend fun RequestMedWandUsbPermission(
+        usbManager: UsbManager,
+        medWandDevice: UsbDevice? = FindMedWandUsbDevice(usbManager)
+    ): Boolean {
+        medWandDevice ?: return true
         if (usbManager.hasPermission(medWandDevice)) {
             return true
         }
@@ -387,16 +403,12 @@ private class MainWindow(private val activity: Activity) {
         var registered = false
         try {
             val filter = IntentFilter(ACTION_USB_PERMISSION)
-            // Android 13+ requires an explicit receiver export flag for dynamic
-            // registration of this app-private permission result receiver.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 activity.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
                 activity.registerReceiver(receiver, filter)
             }
             registered = true
-            // Opens the platform permission dialog for the USB device selected
-            // by FindMedWandUsbDevice.
             usbManager.requestPermission(medWandDevice, permissionIntent)
             return result.await()
         } finally {
@@ -406,10 +418,6 @@ private class MainWindow(private val activity: Activity) {
         }
     }
 
-    /**
-     * Locates the attached MedWand USB device from Android's current USB device
-     * list using the known product id first, then visible device metadata.
-     */
     private fun FindMedWandUsbDevice(usbManager: UsbManager): UsbDevice? {
         val devices = usbManager.deviceList.values
         return devices.firstOrNull { it.productId == 60 }
@@ -419,6 +427,130 @@ private class MainWindow(private val activity: Activity) {
             }
     }
 
+    private suspend fun CheckFirmwareUpdate(update: FirmwareUpdateRequest): Boolean {
+        UpdateStatus("Firmware update required.")
+        val message = if (update.recovery) {
+            """
+            The MedWand could not start in normal mode and may be in bootloader or recovery state.
+
+            Firmware recovery will install the latest available firmware.
+
+            Keep the MedWand connected and powered during the update.
+            """.trimIndent()
+        } else {
+            """
+            A new MedWand firmware update is available.
+
+            Current version: ${update.currentVersion}
+            New version: ${update.targetVersion}
+
+            Keep the MedWand connected and powered during the update.
+            """.trimIndent()
+        }
+
+        val result = MessageBox(
+            message,
+            if (update.recovery) "Firmware Recovery Required" else "Firmware Update Available",
+            listOf(MessageBoxResult.StartFirmwareUpdate, MessageBoxResult.Exit)
+        )
+
+        if (result == MessageBoxResult.Exit) {
+            Cleanup()
+            activity.finishAndRemoveTask()
+            return false
+        }
+
+        return RunFirmwareUpdate(update.currentVersion, update.targetVersion)
+    }
+
+    /**
+     * Gives the firmware updater exclusive ownership of the MedWand USB device,
+     * displays its progress, then reconnects the normal SDK controller after a
+     * successful update. The updater itself owns bootloader re-enumeration.
+     */
+    private suspend fun RunFirmwareUpdate(currentVersion: String, targetVersion: String): Boolean {
+        SetNavigation(false, false)
+        FirmwareUpdateVisible = true
+        FirmwareUpdateState = "Starting"
+        FirmwareUpdateProgress = 0
+        FirmwareUpdateMessage =
+            "Updating MedWand firmware from $currentVersion to $targetVersion. Do not disconnect the device."
+        UpdateStatus("Starting firmware update.")
+
+        ReleaseMedWandController()
+
+        val usbManager = activity.getSystemService(Activity.USB_SERVICE) as UsbManager
+        val firmwareController = FirmwareController(
+            context = activity.applicationContext,
+            usbPermissionRequester = { device -> RequestMedWandUsbPermission(usbManager, device) }
+        )
+        var lastError: String? = null
+
+        firmwareController.FirmwareStateChanged = { _, state ->
+            activity.runOnUiThread {
+                FirmwareUpdateState = state.name
+                FirmwareUpdateMessage = when (state) {
+                    UpdaterState.Initializing -> "Preparing the device and firmware package."
+                    UpdaterState.Reconnecting -> "The MedWand is reconnecting. Keep it connected."
+                    UpdaterState.Erasing -> "Erasing the old firmware. Do not disconnect the MedWand."
+                    UpdaterState.Programming -> "Programming the new firmware."
+                    UpdaterState.Reading -> "Reading the programmed firmware back."
+                    UpdaterState.Verifying -> "Verifying the new firmware."
+                    UpdaterState.Commiting -> "Committing the verified firmware. Do not disconnect the MedWand."
+                    UpdaterState.Complete -> "Firmware update completed."
+                }
+                UpdateStatus("Firmware update: ${state.name}")
+            }
+        }
+        firmwareController.FirmwareProgressChanged = { _, progress ->
+            activity.runOnUiThread {
+                FirmwareUpdateProgress = progress.coerceIn(0, 100)
+            }
+        }
+        firmwareController.FirmwareError = { _, exception ->
+            lastError = exception.message
+        }
+        firmwareController.DeviceErrorReceived = { _, exception ->
+            lastError = exception.message
+        }
+
+        val success = try {
+            firmwareController.StartAsync()
+        } catch (ex: Exception) {
+            lastError = ex.message
+            false
+        } finally {
+            firmwareController.DisposeAsync()
+        }
+
+        if (!success) {
+            FirmwareUpdateState = "Failed"
+            FirmwareUpdateMessage = lastError?.let { "Firmware update failed: $it" }
+                ?: "Firmware update failed. Please restart the application and try again."
+            UpdateStatus("Firmware update failed.")
+            MessageBox(
+                FirmwareUpdateMessage,
+                "Firmware Update Failed",
+                listOf(MessageBoxResult.Exit)
+            )
+            Cleanup()
+            activity.finishAndRemoveTask()
+            return false
+        }
+
+        FirmwareUpdateState = "Complete"
+        FirmwareUpdateProgress = 100
+        FirmwareUpdateMessage = "Firmware update completed. Reconnecting to the MedWand."
+        UpdateStatus("Firmware update complete. Reconnecting.")
+
+        val remainingUpdate = ConnectMedWand()
+        if (remainingUpdate != null) {
+            throw Exception("MedWand still requires firmware update after the update completed.")
+        }
+        FirmwareUpdateVisible = false
+        return true
+    }
+
     /**
      * Initializes the connected controller and attaches SDK reading callbacks
      * used by the active sensor view.
@@ -426,21 +558,21 @@ private class MainWindow(private val activity: Activity) {
     private fun InitializeMedWand() {
         UpdateStatus("Initializing MedWand")
 
-        if (_medWandController?.isConnected != true) {
+        if (_medWandController?.IsConnected != true) {
             throw Exception("MedWand not connected.")
         }
 
         // Initializes the physical MedWand through the SDK before any workflow
         // view can be enabled.
-        _medWandController?.initialize()
+        _medWandController?.Initialize()
 
-        if (_medWandController?.isInitialized != true) {
+        if (_medWandController?.IsInitialized != true) {
             throw Exception("MedWand not initialized.")
         }
 
         // Reading callbacks are routed by sensor type to the current workflow.
-        _medWandController?.onReadingStateChanged = { MedWandController_ReadingStateChanged(it) }
-        _medWandController?.onReadingReceived = { MedWandController_ReadingReceived(it) }
+        _medWandController?.OnReadingStateChanged = { MedWandController_ReadingStateChanged(it) }
+        _medWandController?.OnReadingReceived = { MedWandController_ReadingReceived(it) }
     }
 
     /**
@@ -448,7 +580,7 @@ private class MainWindow(private val activity: Activity) {
      * workflows currently available in this application.
      */
     private fun InitializeUserInterface() {
-        if (_medWandController?.isInitialized != true) {
+        if (_medWandController?.IsInitialized != true) {
             SetNavigation(false, true)
             return
         }
@@ -470,6 +602,7 @@ private class MainWindow(private val activity: Activity) {
             requireNotNull(_medWandController),
             activity,
             File(activity.filesDir, "camera-captures"),
+            { RequestMedWandUsbPermission(activity.getSystemService(Activity.USB_SERVICE) as UsbManager) },
             { CurrentSensorView_ViewLockStateChanged(locked = it) }
         )
         _ecgView = EcgView(
@@ -477,17 +610,15 @@ private class MainWindow(private val activity: Activity) {
             capturesFile = File(activity.filesDir, "captures.txt"),
             locked = { CurrentSensorView_ViewLockStateChanged(locked = it) }
         )
-        // Connects the ECG SDK render target to the controller so ECG frames
-        // are delivered through EcgGridContainer.render(imageBytes).
-        _medWandController?.configure(_ecgView?.GridContainer)
+        _medWandController?.Configure(null)
 
         DeviceInformation()
 
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
-        ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
+        ToolButtonStethoscopeEnabled = _medWandController?.HasValidStethoscope == true
         ToolButtonCameraEnabled =
-            _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
+            _medWandController?.CanUseCamera == true && _medWandController?.HasValidOtoscope == true
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
         ToolButtonExitEnabled = true
@@ -499,7 +630,7 @@ private class MainWindow(private val activity: Activity) {
      * details read from the initialized SDK controller.
      */
     private fun DeviceInformation() {
-        if (_medWandController?.isConnected != true) {
+        if (_medWandController?.IsConnected != true) {
             throw Exception("MedWand not connected.")
         }
 
@@ -513,18 +644,18 @@ private class MainWindow(private val activity: Activity) {
 
             Device Information:
             --------------------------------
-            ComPort: ${_medWandController?.comPort}
-            VendorId: ${_medWandController?.vendorId}
-            ProductId: ${_medWandController?.productId}
-            DeviceId: ${_medWandController?.deviceId}
-            UDI: ${_medWandController?.udi}
-            DeviceState: ${_medWandController?.deviceState}
-            IsConnected: ${_medWandController?.isConnected}
-            IsInitialized: ${_medWandController?.isInitialized}
-            IsBootloaderMode: ${_medWandController?.isBootloaderMode(false)}
-            Firmware: ${_medWandController?.firmwareVersion}
-            Generation: ${_medWandController?.generation}
-            Camera: ${_medWandController?.cameraModel}
+            ComPort: ${_medWandController?.ComPort}
+            VendorId: ${_medWandController?.VendorId}
+            ProductId: ${_medWandController?.ProductId}
+            DeviceId: ${_medWandController?.DeviceId}
+            UDI: ${_medWandController?.Udi}
+            DeviceState: ${_medWandController?.DeviceState}
+            IsConnected: ${_medWandController?.IsConnected}
+            IsInitialized: ${_medWandController?.IsInitialized}
+            IsBootloaderMode: ${_medWandController?.IsBootloaderMode(false)}
+            Firmware: ${_medWandController?.FirmwareVersion}
+            Generation: ${_medWandController?.Generation}
+            Camera: ${_medWandController?.CameraModel}
         """.trimIndent()
     }
 
@@ -534,10 +665,10 @@ private class MainWindow(private val activity: Activity) {
     private fun SetNavigation(enabled: Boolean, exitEnabled: Boolean) {
         ToolButtonThermometerEnabled = enabled
         ToolButtonPulseOximeterEnabled = enabled
-        ToolButtonStethoscopeEnabled = enabled && _medWandController?.hasValidStethoscope == true
+        ToolButtonStethoscopeEnabled = enabled && _medWandController?.HasValidStethoscope == true
         ToolButtonCameraEnabled = enabled &&
-                _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
-        ToolButtonEcgEnabled = enabled && _medWandController?.hasValidEcg == true
+                _medWandController?.CanUseCamera == true && _medWandController?.HasValidOtoscope == true
+        ToolButtonEcgEnabled = enabled && _medWandController?.HasValidEcg == true
         ToolButtonSummaryEnabled = enabled
         ToolButtonExitEnabled = exitEnabled
     }
@@ -567,6 +698,18 @@ private class MainWindow(private val activity: Activity) {
         sensorView.Activate()
     }
 
+    /** Releases only the normal SDK controller and its callbacks. */
+    private fun ReleaseMedWandController() {
+        _medWandController?.StopSensor()
+        _medWandController?.OnLicenseError = {}
+        _medWandController?.OnDeviceError = {}
+        _medWandController?.OnDeviceStateChanged = {}
+        _medWandController?.OnReadingStateChanged = {}
+        _medWandController?.OnReadingReceived = {}
+        _medWandController?.Dispose()
+        _medWandController = null
+    }
+
     /**
      * Stops the active workflow, clears SDK callbacks, stops any active sensor,
      * and closes the controller.
@@ -588,16 +731,8 @@ private class MainWindow(private val activity: Activity) {
         _cameraView = null
         _ecgView = null
 
-        // StopSensor is called during cleanup so any currently active sensor is
-        // stopped before callbacks and the controller are released.
-        _medWandController?.stopSensor(false)
-        _medWandController?.onLicenseError = {}
-        _medWandController?.onDeviceError = {}
-        _medWandController?.onDeviceStateChanged = {}
-        _medWandController?.onReadingStateChanged = {}
-        _medWandController?.onReadingReceived = {}
-        _medWandController?.close()
-        _medWandController = null
+        // Stop the active sensor and release callbacks/serial ownership.
+        ReleaseMedWandController()
     }
 
     /** Shows the Thermometer workflow when the toolbar action is enabled. */
@@ -671,9 +806,9 @@ private class MainWindow(private val activity: Activity) {
     private fun CurrentSensorView_ViewLockStateChanged(locked: Boolean) {
         ToolButtonThermometerEnabled = true
         ToolButtonPulseOximeterEnabled = true
-        ToolButtonStethoscopeEnabled = _medWandController?.hasValidStethoscope == true
+        ToolButtonStethoscopeEnabled = _medWandController?.HasValidStethoscope == true
         ToolButtonCameraEnabled =
-            _medWandController?.canUseCamera == true && _medWandController?.hasValidOtoscope == true
+            _medWandController?.CanUseCamera == true && _medWandController?.HasValidOtoscope == true
         ToolButtonEcgEnabled = true
         ToolButtonSummaryEnabled = false
         ToolButtonExitEnabled = true
@@ -694,7 +829,7 @@ private class MainWindow(private val activity: Activity) {
     /**
      * Routes SDK reading-state text to the active workflow status area.
      */
-    private fun MedWandController_ReadingStateChanged(readingState: EnumReadingState) {
+    private fun MedWandController_ReadingStateChanged(readingState: ReadingState) {
         _currentSensorView?.OnReadingStateChanged(readingState)
     }
 
@@ -706,9 +841,9 @@ private class MainWindow(private val activity: Activity) {
         val sensorType = MedWandSensorFromReading(reading) ?: return
 
         when (sensorType) {
-            EnumSensor.Thermometer -> _currentSensorView?.OnReadingReceived(reading)
-            EnumSensor.PulseOximeter -> _currentSensorView?.OnReadingReceived(reading)
-            EnumSensor.Ecg -> _currentSensorView?.OnReadingReceived(reading)
+            MedWandSensor.Thermometer -> _currentSensorView?.OnReadingReceived(reading)
+            MedWandSensor.PulseOximeter -> _currentSensorView?.OnReadingReceived(reading)
+            MedWandSensor.Ecg -> _currentSensorView?.OnReadingReceived(reading)
             else -> Unit
         }
     }
@@ -717,14 +852,14 @@ private class MainWindow(private val activity: Activity) {
      * Converts the SDK reading sensor type into the enum used by application
      * workflow routing.
      */
-    private fun MedWandSensorFromReading(reading: MedWandReading): EnumSensor? {
-        val sensorType = reading.sensorType.orEmpty().trim()
-        return EnumSensor.values().firstOrNull { it.name.equals(sensorType, ignoreCase = true) }
+    private fun MedWandSensorFromReading(reading: MedWandReading): MedWandSensor? {
+        val sensorType = reading.SensorType.orEmpty().trim()
+        return MedWandSensor.values().firstOrNull { it.name.equals(sensorType, ignoreCase = true) }
             ?: when (sensorType.lowercase()) {
                 // The Android SDK emits "spo2" for Pulse Oximeter readings.
-                "spo2" -> EnumSensor.PulseOximeter
+                "spo2" -> MedWandSensor.PulseOximeter
                 // The Android SDK emits "ecg" for ECG readings.
-                "ecg" -> EnumSensor.Ecg
+                "ecg" -> MedWandSensor.Ecg
                 else -> null
             }
     }
@@ -781,7 +916,49 @@ private class MainWindow(private val activity: Activity) {
                 .fillMaxSize()
                 .background(ActionButtonDisabled)
         ) {
-            if (current == null) {
+            if (FirmwareUpdateVisible) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(48.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = "Firmware Update",
+                        color = Color.Black,
+                        fontSize = 30.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = FirmwareUpdateState,
+                        color = Color.Black,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    LinearProgressIndicator(
+                        progress = FirmwareUpdateProgress / 100f,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(10.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "$FirmwareUpdateProgress%",
+                        color = Color.Black,
+                        fontSize = 18.sp
+                    )
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Text(
+                        text = FirmwareUpdateMessage,
+                        color = Color.Black,
+                        fontSize = 18.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else if (current == null) {
                 Text(
                     text = PlaceholderInfo,
                     color = Color.Black,
@@ -808,7 +985,7 @@ private class ThermometerView(
 ) : ISensorView {
     private val _viewModel = ThermometerViewModel(medWandController, locked)
 
-    override val MedWandSensor: EnumSensor = EnumSensor.Thermometer
+    override val MedWandSensor: MedWandSensor = com.medwand.sdk_core.MedWandSensor.Thermometer
     override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
 
     /** Initializes Thermometer display state when the view becomes active. */
@@ -821,7 +998,7 @@ private class ThermometerView(
     }
 
     /** Forwards SDK reading-state changes into Thermometer status text. */
-    override fun OnReadingStateChanged(readingState: EnumReadingState) =
+    override fun OnReadingStateChanged(readingState: ReadingState) =
         _viewModel.OnReadingStateChanged(readingState)
 
     /** Forwards Thermometer SDK readings into the view model display state. */
@@ -871,7 +1048,7 @@ private class ThermometerViewModel(
     }
 
     /** Updates the visible workflow status from the SDK reading state. */
-    fun OnReadingStateChanged(state: EnumReadingState) {
+    fun OnReadingStateChanged(state: ReadingState) {
         SetStatus(state.toString())
     }
 
@@ -906,8 +1083,8 @@ private class ThermometerViewModel(
             _setLocked(true)
 
             // Starts Thermometer readings through the SDK; readings arrive later
-            // through MedWandController.onReadingReceived.
-            if (_controller.startThermometer()) {
+            // through MedWandController.OnReadingReceived.
+            if (_controller.StartThermometer()) {
                 SetAction(ActionState.Busy)
             } else {
                 SetAction(ActionState.Idle)
@@ -927,7 +1104,7 @@ private class ThermometerViewModel(
 
             if (!fromTimeout) {
                 // Stops the SDK's active sensor without requesting timeout handling.
-                _controller.stopSensor(false)
+                _controller.StopSensor()
             }
 
             SetAction(ActionState.Idle)
@@ -946,7 +1123,7 @@ private class ThermometerViewModel(
         fun FormatTemp(raw: String): String =
             if (raw.isEmpty() || raw == "Reading") "--" else "$raw F"
 
-        TempObject = FormatTemp(reading.tempObject.orEmpty())
+        TempObject = FormatTemp(reading.TempObject.orEmpty())
     }
 
     /** Updates the Thermometer workflow status label. */
@@ -973,7 +1150,7 @@ private class ThermometerViewModel(
             }
         }
 
-        SetStatus(_controller.readingState.toString())
+        SetStatus(_controller.ReadingState.toString())
     }
 
     /** Sets the action button to the active-reading Stop state. */
@@ -1013,7 +1190,7 @@ private class PulseOximeterView(
     private val _medWandController = medWandController
     private val _viewModel = PulseOximeterViewModel(_medWandController, locked)
 
-    override val MedWandSensor: EnumSensor = EnumSensor.PulseOximeter
+    override val MedWandSensor: MedWandSensor = com.medwand.sdk_core.MedWandSensor.PulseOximeter
     override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
 
     /** Initializes Pulse Oximeter display state when the view becomes active. */
@@ -1026,7 +1203,7 @@ private class PulseOximeterView(
     }
 
     /** Forwards SDK reading-state changes into Pulse Oximeter status text. */
-    override fun OnReadingStateChanged(readingState: EnumReadingState) =
+    override fun OnReadingStateChanged(readingState: ReadingState) =
         _viewModel.OnReadingStateChanged(readingState)
 
     /** Forwards Pulse Oximeter SDK readings into the view model display state. */
@@ -1072,16 +1249,16 @@ private class PulseOximeterViewModel(
      */
     fun Initialize() {
         _reading = MedWandReading().apply {
-            timeStamp = Instant.now()
-            status = ""
-            index = 1
-            count = 0
-            sensorType = EnumSensor.PulseOximeter.name
-            tempAmbient = ""
-            tempObject = ""
-            pulseRate = null
-            spo2 = null
-            ecgData = null
+            TimeStamp = Instant.now()
+            Status = ""
+            Index = 1
+            Count = 0
+            SensorType = MedWandSensor.PulseOximeter.name
+            TempAmbient = ""
+            TempObject = ""
+            PulseRate = null
+            Spo2 = null
+            EcgData = null
         }
 
         UpdateReadingText()
@@ -1089,7 +1266,7 @@ private class PulseOximeterViewModel(
     }
 
     /** Updates the visible workflow status from the SDK reading state. */
-    fun OnReadingStateChanged(state: EnumReadingState) {
+    fun OnReadingStateChanged(state: ReadingState) {
         SetStatus(state.toString())
     }
 
@@ -1124,8 +1301,8 @@ private class PulseOximeterViewModel(
             _setLocked(true)
 
             // Starts SpO2 and pulse-rate readings through the SDK; values arrive
-            // through MedWandController.onReadingReceived.
-            if (_controller.startPulseOximeter()) {
+            // through MedWandController.OnReadingReceived.
+            if (_controller.StartPulseOximeter()) {
                 SetAction(ActionState.Busy)
             } else {
                 SetAction(ActionState.Idle)
@@ -1145,7 +1322,7 @@ private class PulseOximeterViewModel(
 
             if (!fromTimeout) {
                 // Stops the SDK's active sensor without requesting timeout handling.
-                _controller.stopSensor(false)
+                _controller.StopSensor()
             }
 
             SetAction(ActionState.Idle)
@@ -1160,8 +1337,8 @@ private class PulseOximeterViewModel(
     /** Updates the SpO2 and pulse-rate labels from the latest SDK reading. */
     private fun UpdateReadingText() {
         val reading = _reading ?: return
-        SpO2 = "SpO2 : ${reading.spo2.orEmpty()}"
-        PulseRate = "PulseRate : ${reading.pulseRate.orEmpty()}"
+        reading.Spo2?.takeIf { it.isNotBlank() && it != "--" }?.let { SpO2 = "SpO2 : $it" }
+        reading.PulseRate?.takeIf { it.isNotBlank() && it != "--" }?.let { PulseRate = "PulseRate : $it" }
     }
 
     /** Updates the Pulse Oximeter workflow status label. */
@@ -1188,7 +1365,7 @@ private class PulseOximeterViewModel(
             }
         }
 
-        SetStatus(_controller.readingState.toString())
+        SetStatus(_controller.ReadingState.toString())
     }
 
     /** Sets the action button to the active-reading Stop state. */
@@ -1228,7 +1405,7 @@ private class StethoscopeView(
     private var _captured = 0
     private var _isActivated = false
 
-    override val MedWandSensor: EnumSensor = EnumSensor.Stethoscope
+    override val MedWandSensor: MedWandSensor = com.medwand.sdk_core.MedWandSensor.Stethoscope
     override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
 
     var StatusMessage by mutableStateOf("Off : Ready [0 Captured]")
@@ -1239,9 +1416,9 @@ private class StethoscopeView(
     override fun Activate() {
         if (!_isActivated) {
             _isActivated = true
-            _controller.stethoscope?.let { stethoscope ->
-                _previousRecordedFramesHandler = stethoscope.onRecordedFramesReady
-                stethoscope.onRecordedFramesReady = { bytes ->
+            _controller.Stethoscope?.let { stethoscope ->
+                _previousRecordedFramesHandler = stethoscope.RecordedFramesReady
+                stethoscope.RecordedFramesReady = { bytes ->
                     _previousRecordedFramesHandler?.invoke(bytes)
                     OnRecordedFramesReady(bytes)
                 }
@@ -1254,20 +1431,20 @@ private class StethoscopeView(
     override fun Deactivate() {
         if (ButtonActionState == ActionState.Busy) StopCapture()
         SetStethoscopeMode(StethoscopeHelpers.MicrophoneModes.Off)
-        _controller.stethoscope?.onRecordedFramesReady = _previousRecordedFramesHandler
+        _controller.Stethoscope?.RecordedFramesReady = _previousRecordedFramesHandler
         _previousRecordedFramesHandler = null
         _isActivated = false
     }
 
-    override fun OnReadingStateChanged(readingState: EnumReadingState) = UpdateStatus()
+    override fun OnReadingStateChanged(readingState: ReadingState) = UpdateStatus()
     override fun OnReadingReceived(reading: MedWandReading) = Unit
     override fun OnDeviceError(error: MedWandDeviceError?) = SetAction(if (error == null) ActionState.Idle else ActionState.Disabled)
 
     fun SetStethoscopeMode(mode: StethoscopeHelpers.MicrophoneModes) {
         if (ButtonActionState == ActionState.Busy) StopCapture()
-        runCatching { _controller.setStethoscopeMode(mode) }
+        runCatching { _controller.SetStethoscopeMode(mode, null) }
             .onFailure { println(it.message) }
-        StethoscopeMode = _controller.stethoscopeMode
+        StethoscopeMode = _controller.StethoscopeMode
         UpdateStatus()
     }
 
@@ -1280,15 +1457,15 @@ private class StethoscopeView(
     }
 
     private fun StartCapture() {
-        if (_controller.stethoscopeMode == StethoscopeHelpers.MicrophoneModes.Off) {
+        if (_controller.StethoscopeMode == StethoscopeHelpers.MicrophoneModes.Off) {
             StatusMessage = "Select Heart, Lungs, or Bowel before recording."
             return
         }
 
         SetAction(ActionState.Disabled)
-        runCatching { _controller.startRecording() }
+        runCatching { _controller.StartRecording() }
             .onSuccess {
-                SetAction(if (_controller.stethoscope?.isRecording == true) ActionState.Busy else ActionState.Idle)
+                SetAction(ActionState.Busy)
             }
             .onFailure {
                 println(it.message)
@@ -1298,7 +1475,7 @@ private class StethoscopeView(
 
     private fun StopCapture() {
         SetAction(ActionState.Disabled)
-        runCatching { _controller.stopRecording() }
+        runCatching { _controller.StopRecording() }
             .onFailure { println(it.message) }
         SetAction(ActionState.Idle)
     }
@@ -1315,20 +1492,20 @@ private class StethoscopeView(
     }
 
     private fun UpdateStatus() {
-        val readingState = when (_controller.readingState) {
-            EnumReadingState.Stopped -> "Ready"
-            EnumReadingState.Starting,
-            EnumReadingState.Started,
-            EnumReadingState.Reading -> "On"
-            else -> _controller.readingState.toString()
+        val readingState = when (_controller.ReadingState) {
+            ReadingState.Stopped -> "Ready"
+            ReadingState.Starting,
+            ReadingState.Started,
+            ReadingState.Reading -> "On"
+            else -> _controller.ReadingState.toString()
         }
-        StatusMessage = "${_controller.stethoscopeMode} : $readingState [$_captured Captured]"
+        StatusMessage = "${_controller.StethoscopeMode} : $readingState [$_captured Captured]"
     }
 
     private fun OnRecordedFramesReady(bytes: ByteArray) {
         runCatching {
             _capturesFile.appendText(
-                "[${Instant.now()}] ${_controller.stethoscopeModel} ${_controller.stethoscopeMode} -> ${bytes.size}\n"
+                "[${Instant.now()}] ${_controller.StethoscopeModel} ${_controller.StethoscopeMode} -> ${bytes.size}\n"
             )
             _captured++
             UpdateStatus()
@@ -1344,145 +1521,24 @@ private class StethoscopeView(
 }
 
 
-/**
- * UVC preview target that preserves the SDK preview behavior while exposing
- * the actual frame dimensions reported by the camera callback.
- */
-private class SizedUvcCameraPreviewTarget(context: Context) : CameraPreviewTarget {
-    private val _delegate = UvcCameraPreviewTarget(context)
-
-    @Volatile
-    var FrameWidth: Int = 0
-        private set
-
-    @Volatile
-    var FrameHeight: Int = 0
-        private set
-
-    override fun resolveCameraDeviceInfo() = _delegate.resolveCameraDeviceInfo()
-
-    override fun resolveCameraModel() = _delegate.resolveCameraModel()
-
-    override fun setFocusMode(focusMode: CameraHelper.FocusModes) =
-        _delegate.setFocusMode(focusMode)
-
-    override fun setFocusModeValue(focusPercent: Int) =
-        _delegate.setFocusModeValue(focusPercent)
-
-    override fun start(
-        width: Int,
-        height: Int,
-        frameRate: Int,
-        onFrame: (ByteArray, Int, Int) -> Unit
-    ) {
-        FrameWidth = width
-        FrameHeight = height
-        _delegate.start(width, height, frameRate) { bytes, actualWidth, actualHeight ->
-            FrameWidth = actualWidth
-            FrameHeight = actualHeight
-            onFrame(bytes, actualWidth, actualHeight)
-        }
-    }
-
-    override fun stop() {
-        _delegate.stop()
-        FrameWidth = 0
-        FrameHeight = 0
-    }
-}
-
-/**
- * Lightweight camera surface that copies the SDK's ARGB frame directly into a
- * reusable Bitmap and draws it centered with aspect-ratio-preserving Fit.
- */
-private class CameraPreviewSurface(context: Context) : View(context) {
-    private val _bitmapLock = Any()
-    private val _destination = RectF()
-    private val _paint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private var _bitmap: Bitmap? = null
-
-    init {
-        setBackgroundColor(android.graphics.Color.BLACK)
-    }
-
-    /**
-     * Copies the SDK frame into the reusable display bitmap
-     */
-    fun RenderFrame(frameBytes: ByteArray, frameWidth: Int, frameHeight: Int): Boolean {
-        if (frameWidth <= 0 || frameHeight <= 0) return false
-
-        val expectedByteCount = frameWidth.toLong() * frameHeight.toLong() * 4L
-        if (expectedByteCount <= 0L || expectedByteCount > Int.MAX_VALUE) return false
-        if (frameBytes.size < expectedByteCount.toInt()) return false
-
-        var isFirstFrame = false
-        synchronized(_bitmapLock) {
-            var bitmap = _bitmap
-            if (bitmap == null || bitmap.width != frameWidth || bitmap.height != frameHeight) {
-                bitmap?.recycle()
-                bitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
-                _bitmap = bitmap
-                isFirstFrame = true
-            }
-
-            bitmap.copyPixelsFromBuffer(
-                ByteBuffer.wrap(frameBytes, 0, expectedByteCount.toInt())
-            )
-        }
-
-        postInvalidateOnAnimation()
-        return isFirstFrame
-    }
-
-    /** Releases the current display frame and returns the surface to black. */
-    fun Clear() {
-        synchronized(_bitmapLock) {
-            _bitmap?.recycle()
-            _bitmap = null
-        }
-        postInvalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-
-        synchronized(_bitmapLock) {
-            val bitmap = _bitmap ?: return
-            if (width <= 0 || height <= 0) return
-
-            val scale = minOf(
-                width.toFloat() / bitmap.width.toFloat(),
-                height.toFloat() / bitmap.height.toFloat()
-            )
-            val drawWidth = bitmap.width * scale
-            val drawHeight = bitmap.height * scale
-            val left = (width - drawWidth) / 2f
-            val top = (height - drawHeight) / 2f
-
-            _destination.set(left, top, left + drawWidth, top + drawHeight)
-            canvas.drawBitmap(bitmap, null, _destination, _paint)
-        }
-    }
-}
-
-
 /** Camera workflow with live Dermatoscope/Otoscope preview and still capture. */
 private class CameraView(
     private val _controller: MedWandController,
     private val _activity: Activity,
     private val _capturesDirectory: File,
+    private val _requestMedWandUsbPermission: suspend () -> Boolean,
     private val _setLocked: (Boolean) -> Unit
 ) : ISensorView {
     private val _scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var _previewJob: Job? = null
-    private var _previewTarget: SizedUvcCameraPreviewTarget? = null
-    private var _previewSurface: CameraPreviewSurface? = null
+    private var _previewImageView: ImageView? = null
     private var _previousRecordedFrameHandler: ((ByteArray) -> Unit)? = null
     private var _previousLedIntensityHandler: ((Int) -> Unit)? = null
     private var _isActivated = false
     private var _previewSession = 0L
+    private var _cameraDeviceKey: String? = null
 
-    override val MedWandSensor: EnumSensor = EnumSensor.Otoscope
+    override val MedWandSensor: MedWandSensor = com.medwand.sdk_core.MedWandSensor.Otoscope
     override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
 
     var HasFrame by mutableStateOf(false)
@@ -1495,6 +1551,7 @@ private class CameraView(
     var LedControlAvailable by mutableStateOf(false)
     var LedIntensityAdjustable by mutableStateOf(false)
     var FocusValue by mutableStateOf(0)
+    var FocusValueMin by mutableStateOf(0)
     var FocusValueMax by mutableStateOf(0)
     var ManualFocusEnabled by mutableStateOf(false)
     var AutoFocusAvailable by mutableStateOf(false)
@@ -1504,26 +1561,26 @@ private class CameraView(
     override fun Activate() {
         if (!_isActivated) {
             _isActivated = true
-            _controller.camera?.let { camera ->
-                _previousRecordedFrameHandler = camera.onRecordedFrameReady
-                camera.onRecordedFrameReady = { bytes ->
+            _controller.Camera?.let { camera ->
+                _previousRecordedFrameHandler = camera.RecordedFrameReady
+                camera.RecordedFrameReady = { bytes ->
                     _previousRecordedFrameHandler?.invoke(bytes)
                     OnRecordedFrameReady(bytes)
                 }
             }
-            _previousLedIntensityHandler = _controller.onLedIntensityChanged
-            _controller.onLedIntensityChanged = { intensity ->
+            _previousLedIntensityHandler = _controller.OnLedIntensityChanged
+            _controller.OnLedIntensityChanged = { intensity ->
                 _previousLedIntensityHandler?.invoke(intensity)
                 _activity.runOnUiThread {
                     LedIntensity = intensity.coerceIn(0, LedIntensityMax.coerceAtLeast(0))
                 }
             }
-            _controller.setCameraFrameHandler { frameBytes -> OnFrameReady(frameBytes) }
+            _controller.Camera?.FrameReady = { frameBytes -> OnFrameReady(frameBytes) }
         }
 
-        CameraMode = _controller.cameraMode
-        if (_controller.cameraIsMonitoring) UpdateCameraControls() else ResetCameraControls()
-        UpdateStatus(if (_controller.cameraIsMonitoring) "On" else "Ready")
+        CameraMode = _controller.CameraMode
+        if (_controller.CameraIsMonitoring) UpdateCameraControls() else ResetCameraControls()
+        UpdateStatus(if (_controller.CameraIsMonitoring) "On" else "Ready")
     }
 
     override fun Deactivate() {
@@ -1534,25 +1591,24 @@ private class CameraView(
         IsStarting = false
         _setLocked(false)
 
-        runCatching { _controller.stopSensor(false) }
+        runCatching { _controller.StopSensor() }
             .onFailure { println(it.message) }
 
-        _controller.setCameraFrameHandler(null)
-        _controller.camera?.onRecordedFrameReady = _previousRecordedFrameHandler
+        _controller.Camera?.FrameReady = null
+        _controller.Camera?.RecordedFrameReady = _previousRecordedFrameHandler
         _previousRecordedFrameHandler = null
-        _controller.onLedIntensityChanged = _previousLedIntensityHandler
+        _controller.OnLedIntensityChanged = _previousLedIntensityHandler
         _previousLedIntensityHandler = null
-        _previewTarget = null
-        _previewSurface?.Clear()
+        _previewImageView?.setImageDrawable(null)
         CameraMode = CameraHelper.CameraModes.Off
         HasFrame = false
         ResetCameraControls()
         UpdateStatus("Ready")
     }
 
-    override fun OnReadingStateChanged(readingState: EnumReadingState) {
+    override fun OnReadingStateChanged(readingState: ReadingState) {
         if (CameraMode != CameraHelper.CameraModes.Off) {
-            UpdateStatus(if (_controller.cameraIsMonitoring) "On" else readingState.toString())
+            UpdateStatus(if (_controller.CameraIsMonitoring) "On" else readingState.toString())
         }
     }
 
@@ -1560,7 +1616,7 @@ private class CameraView(
 
     override fun OnDeviceError(error: MedWandDeviceError?) {
         if (error != null) {
-            StatusMessage = "${CameraMode.displayName()} : Error - ${error.exception.message ?: error.errorCode.toString()} [$CapturedCount Captured]"
+            StatusMessage = "${CameraMode.displayName()} : Error - ${error.Exception.message ?: error.Code.toString()} [$CapturedCount Captured]"
         }
     }
 
@@ -1574,91 +1630,101 @@ private class CameraView(
     }
 
     fun Capture() {
-        if (!_controller.cameraIsMonitoring || IsStarting) return
-        runCatching { _controller.camera?.recordFrame() }
+        if (!_controller.CameraIsMonitoring || IsStarting) return
+        runCatching { _controller.StartRecording() }
             .onFailure {
                 StatusMessage = "${CameraMode.displayName()} : Capture failed - ${it.message.orEmpty()} [$CapturedCount Captured]"
             }
     }
 
     fun SetLedIntensity(value: Int) {
-        if (!LedControlAvailable || !_controller.cameraIsMonitoring || LedIntensityMax <= 0) return
-        val target = if (LedIntensityAdjustable) {
-            value.coerceIn(0, LedIntensityMax)
-        } else {
-            if (value > 0) LedIntensityMax else 0
+        if (!LedControlAvailable) return
+        val target = value.coerceIn(0, LedIntensityMax)
+        if (target == LedIntensity) return
+        _scope.launch {
+            runCatching { withContext(Dispatchers.IO) { _controller.CameraSetLedIntensity(target) } }
+                .onFailure { ShowControlError("LED", it) }
         }
-        RunControl("LED") { _controller.setCameraLedIntensity(target) }
     }
 
-    fun ToggleLed() {
-        SetLedIntensity(if (LedIntensity > 0) 0 else LedIntensityMax)
-    }
+    fun ToggleLed() = SetLedIntensity(if (LedIntensity > 0) 0 else LedIntensityMax)
 
     fun SetManualFocus(enabled: Boolean) {
-        if (!_controller.cameraIsMonitoring) return
+        if (!_controller.CameraIsMonitoring) return
         if (enabled && !ManualFocusAvailable) return
         if (!enabled && !AutoFocusAvailable) return
 
-        RunControl("focus mode") {
-            _controller.setFocusMode(
-                if (enabled) CameraHelper.FocusModes.Manual else CameraHelper.FocusModes.Auto,
-                resetLastValue = false
-            )
+        _scope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    _controller.CameraSetFocusMode(
+                        if (enabled) CameraHelper.FocusModes.Manual else CameraHelper.FocusModes.Auto,
+                        true
+                    )
+                }
+            }.onFailure { error ->
+                ShowControlError("focus mode", error)
+            }
+            ManualFocusEnabled = _controller.CameraFocusModes == CameraHelper.FocusModes.Manual
         }
     }
 
     fun SetFocusValue(value: Int) {
-        if (!ManualFocusAvailable || !ManualFocusEnabled || FocusValueMax <= 0) return
-        val target = value.coerceIn(0, FocusValueMax)
-        RunControl("manual focus") { _controller.setFocusModeValue(target) }
-    }
+        if (!ManualFocusAvailable || !ManualFocusEnabled || FocusValueMax < FocusValueMin) return
+        val target = value.coerceIn(FocusValueMin, FocusValueMax)
 
-    fun MoveOtoscope(horizontal: Int? = null, vertical: Int? = null) {
-        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
-        runCatching {
-            _controller.cameraMove(horizontal?.times(MOVE_STEP), vertical?.times(MOVE_STEP))
-        }.onFailure { ShowControlError("move", it) }
-    }
-
-    fun ChangeOtoscopeRadius(increment: Int) {
-        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
-        runCatching { _controller.cameraAdjustOtoscopeRadius(increment * RADIUS_STEP) }
-            .onFailure { ShowControlError("circle size", it) }
-    }
-
-    fun ZoomOtoscope(increment: Int) {
-        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.cameraIsMonitoring) return
-        runCatching { _controller.cameraZoom(increment * ZOOM_STEP) }
-            .onFailure { ShowControlError("zoom", it) }
-    }
-
-    private fun RunControl(name: String, update: suspend () -> Boolean) {
         _scope.launch {
-            val updated = runCatching { withContext(Dispatchers.IO) { update() } }
-                .getOrElse { error ->
-                    ShowControlError(name, error)
-                    false
-                }
-            if (updated) UpdateCameraControls()
+            runCatching {
+                withContext(Dispatchers.IO) { _controller.CameraSetFocusValue(target.toDouble()) }
+            }.onFailure { error ->
+                ShowControlError("manual focus", error)
+            }.onSuccess {
+                FocusValue = target
+            }
         }
     }
 
-    private fun UpdateCameraControls() {
-        LedIntensityMax = _controller.cameraLedIntensityMax.coerceAtLeast(0)
-        LedIntensity = _controller.ledIntensity.coerceIn(0, LedIntensityMax)
-        LedIntensityAdjustable = _controller.cameraLedIntensityAdjustable
-        LedControlAvailable = _controller.cameraIsMonitoring && LedIntensityMax > 0
+    fun MoveOtoscope(horizontal: Int? = null, vertical: Int? = null) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.CameraIsMonitoring) return
+        runCatching {
+            _controller.CameraMove(horizontal?.times(MOVE_STEP), vertical?.times(MOVE_STEP))
+        }.onFailure { ShowControlError("move", it) }
+    }
 
-        val focusInfo = _controller.cameraFocusInfo
-        FocusValueMax = focusInfo?.focusMaximum?.coerceAtLeast(0) ?: 0
-        FocusValue = _controller.cameraFocusModeValue.coerceIn(0, FocusValueMax)
-        AutoFocusAvailable = focusInfo?.hasAutoFocus == true
-        ManualFocusAvailable = focusInfo?.hasManualFocus == true && FocusValueMax > 0
-        FocusControlAvailable = _controller.cameraIsMonitoring &&
-                (AutoFocusAvailable || ManualFocusAvailable)
-        ManualFocusEnabled =
-            ManualFocusAvailable && _controller.cameraFocusMode == CameraHelper.FocusModes.Manual
+    fun ZoomOtoscope(increment: Int) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.CameraIsMonitoring) return
+        runCatching { _controller.CameraZoom(increment * ZOOM_STEP) }
+            .onFailure { ShowControlError("zoom", it) }
+    }
+
+    fun RadiusOtoscope(increment: Int) {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.CameraIsMonitoring) return
+        runCatching { _controller.CameraRadius(increment * RADIUS_STEP) }
+            .onFailure { ShowControlError("radius", it) }
+    }
+
+    fun ResetOtoscope() {
+        if (CameraMode != CameraHelper.CameraModes.Otoscope || !_controller.CameraIsMonitoring) return
+        runCatching { _controller.CameraReset() }
+            .onFailure { ShowControlError("reset", it) }
+    }
+
+    private fun UpdateCameraControls() {
+        LedIntensityMax = _controller.CameraLedIntensityMax.coerceAtLeast(0)
+        LedIntensity = _controller.LedIntensity.coerceIn(0, LedIntensityMax.coerceAtLeast(0))
+        LedIntensityAdjustable = _controller.CameraLedIntensityAdjustable
+        LedControlAvailable = _controller.CameraIsMonitoring && LedIntensityMax > 0
+
+        val focusInfo = _controller.CameraFocusInfo
+        FocusValueMin = focusInfo?.FocusMinimum ?: 0
+        FocusValueMax = focusInfo?.FocusMaximum ?: 0
+        if (FocusValueMax >= FocusValueMin) {
+            FocusValue = FocusValue.coerceIn(FocusValueMin, FocusValueMax)
+        }
+        AutoFocusAvailable = focusInfo?.HasAutoFocus == true
+        ManualFocusAvailable = focusInfo?.HasManualFocus == true
+        ManualFocusEnabled = _controller.CameraFocusModes == CameraHelper.FocusModes.Manual
+        FocusControlAvailable = _controller.CameraIsMonitoring && (AutoFocusAvailable || ManualFocusAvailable)
     }
 
     private fun ResetCameraControls() {
@@ -1667,6 +1733,7 @@ private class CameraView(
         LedControlAvailable = false
         LedIntensityAdjustable = false
         FocusValue = 0
+        FocusValueMin = 0
         FocusValueMax = 0
         ManualFocusEnabled = false
         AutoFocusAvailable = false
@@ -1678,34 +1745,45 @@ private class CameraView(
         StatusMessage = "${CameraMode.displayName()} : $name failed - ${error.message.orEmpty()} [$CapturedCount Captured]"
     }
 
-    fun AttachPreviewSurface(surface: CameraPreviewSurface) {
-        _previewSurface = surface
-        if (!HasFrame) surface.Clear()
+    fun AttachPreviewView(view: ImageView) {
+        _previewImageView = view
     }
 
-    fun DetachPreviewSurface(surface: CameraPreviewSurface) {
-        if (_previewSurface === surface) {
-            _previewSurface = null
+    fun DetachPreviewView(view: ImageView) {
+        if (_previewImageView === view) {
+            _previewImageView = null
         }
-        surface.Clear()
+        view.setImageDrawable(null)
     }
 
     private fun StartPreview(mode: CameraHelper.CameraModes) {
+        val previewView = _previewImageView ?: return
+        val cameraDeviceKey = CurrentCameraDeviceKey()
         val session = ++_previewSession
         _previewJob?.cancel()
         HasFrame = false
-        _previewSurface?.Clear()
+        previewView.setImageDrawable(null)
         IsStarting = true
         CameraMode = mode
         UpdateStatus("Starting")
         _setLocked(true)
 
         _previewJob = _scope.launch {
-            val target = SizedUvcCameraPreviewTarget(_activity)
-            _previewTarget = target
             val started = runCatching {
+                val cameraChanged = _cameraDeviceKey != null && cameraDeviceKey != _cameraDeviceKey
+                if (cameraChanged) {
+                    check(_requestMedWandUsbPermission()) {
+                        "USB permission was not granted for the newly connected MedWand."
+                    }
+                }
                 withContext(Dispatchers.IO) {
-                    _controller.setCameraMode(target, mode)
+                    if (cameraChanged) {
+                        _controller.Connect()
+                        check(_controller.IsConnected) { "Could not reconnect to the MedWand after changing cameras." }
+                        _controller.Initialize()
+                        check(_controller.IsInitialized) { "Could not initialize the MedWand after changing cameras." }
+                    }
+                    _controller.SetCameraMode(previewView, mode)
                 }
             }.getOrElse { error ->
                 if (_isActivated && session == _previewSession) {
@@ -1715,28 +1793,43 @@ private class CameraView(
             }
 
             if (!_isActivated || session != _previewSession) {
-                withContext(Dispatchers.IO) { runCatching { _controller.stopSensor(false) } }
+                withContext(Dispatchers.IO) { runCatching { _controller.StopSensor() } }
                 return@launch
             }
 
             IsStarting = false
-            CameraMode = if (started) _controller.cameraMode else CameraHelper.CameraModes.Off
+            CameraMode = if (started) _controller.CameraMode else CameraHelper.CameraModes.Off
             if (started) {
+                _cameraDeviceKey = cameraDeviceKey
                 UpdateCameraControls()
                 if (AutoFocusAvailable) {
                     withContext(Dispatchers.IO) {
-                        _controller.setFocusMode(CameraHelper.FocusModes.Auto, resetLastValue = false)
+                        _controller.CameraSetFocusMode(CameraHelper.FocusModes.Auto, true)
                     }
-                    UpdateCameraControls()
+                    ManualFocusEnabled = _controller.CameraFocusModes == CameraHelper.FocusModes.Manual
                 }
                 UpdateStatus("On")
             } else {
                 ResetCameraControls()
-                val detail = _controller.cameraLastError?.takeIf { it.isNotBlank() } ?: "Preview did not start"
-                StatusMessage = "${mode.displayName()} : Error - $detail [$CapturedCount Captured]"
+                StatusMessage = "${mode.displayName()} : Error - Preview did not start [$CapturedCount Captured]"
                 _setLocked(false)
             }
         }
+    }
+
+    private fun CurrentCameraDeviceKey(): String? {
+        val usbManager = _activity.getSystemService(Context.USB_SERVICE) as UsbManager
+        return usbManager.deviceList.values
+            .filter { device ->
+                (0 until device.interfaceCount).any { index ->
+                    device.getInterface(index).interfaceClass == UsbConstants.USB_CLASS_VIDEO
+                }
+            }
+            .maxByOrNull { device ->
+                listOfNotNull(device.productName, device.manufacturerName)
+                    .count { it.contains("medwand", ignoreCase = true) || it.contains("camera", ignoreCase = true) }
+            }
+            ?.let { "${it.deviceId}:${it.deviceName}:${it.vendorId}:${it.productId}:${it.productName.orEmpty()}" }
     }
 
     private fun StopPreview() {
@@ -1747,14 +1840,13 @@ private class CameraView(
 
         _previewJob = _scope.launch {
             withContext(Dispatchers.IO) {
-                runCatching { _controller.stopSensor(false) }
+                runCatching { _controller.StopSensor() }
             }
             if (!_isActivated || session != _previewSession) return@launch
             IsStarting = false
             CameraMode = CameraHelper.CameraModes.Off
             HasFrame = false
-            _previewSurface?.Clear()
-            _previewTarget = null
+            _previewImageView?.setImageDrawable(null)
             ResetCameraControls()
             _setLocked(false)
             UpdateStatus("Ready")
@@ -1762,18 +1854,12 @@ private class CameraView(
     }
 
     private fun OnFrameReady(frameBytes: ByteArray) {
-        if (!_isActivated || !_controller.cameraIsMonitoring) return
+        if (frameBytes.isEmpty() || !_isActivated || !_controller.CameraIsMonitoring) return
         val session = _previewSession
-        val target = _previewTarget ?: return
-        val surface = _previewSurface ?: return
-        val rendered = surface.RenderFrame(frameBytes, target.FrameWidth, target.FrameHeight)
-
-        if (rendered) {
-            _activity.runOnUiThread {
-                if (_isActivated && session == _previewSession && _controller.cameraIsMonitoring) {
-                    if (!HasFrame) UpdateCameraControls()
-                    HasFrame = true
-                }
+        _activity.runOnUiThread {
+            if (_isActivated && session == _previewSession && _controller.CameraIsMonitoring) {
+                if (!HasFrame) UpdateCameraControls()
+                HasFrame = true
             }
         }
     }
@@ -1782,7 +1868,9 @@ private class CameraView(
         val modeAtCapture = CameraMode
         _scope.launch(Dispatchers.Default) {
             try {
-                val png = _controller.cameraPngFromFrame(frameBytes) ?: ByteArray(0)
+                val encodedImage = _controller.CameraBmpFromCapture(frameBytes).orEmpty()
+                val payload = encodedImage.substringAfter("base64,", encodedImage)
+                val png = if (payload.isNotBlank()) Base64.getDecoder().decode(payload) else ByteArray(0)
                 if (png.isEmpty()) throw Exception("The SDK returned an empty camera frame.")
 
                 _capturesDirectory.mkdirs()
@@ -1794,7 +1882,7 @@ private class CameraView(
 
                 withContext(Dispatchers.Main.immediate) {
                     CapturedCount++
-                    UpdateStatus(if (_controller.cameraIsMonitoring) "On" else "Ready")
+                    UpdateStatus(if (_controller.CameraIsMonitoring) "On" else "Ready")
                 }
             } catch (error: Exception) {
                 withContext(Dispatchers.Main.immediate) {
@@ -1810,8 +1898,8 @@ private class CameraView(
 
     private companion object {
         const val MOVE_STEP = 5
-        const val RADIUS_STEP = 10
         const val ZOOM_STEP = 10
+        const val RADIUS_STEP = 10
     }
 
     override fun close() {
@@ -1833,41 +1921,6 @@ private fun CameraHelper.CameraModes.displayName(): String =
     }
 
 /**
- * SDK render target used as the ECG content container. The SDK supplies image
- * bytes through render(), and Compose displays the latest decoded frame.
- */
-private class EcgGridContainer : EcgRenderTarget {
-    private val _mainHandler = Handler(Looper.getMainLooper())
-
-    var Frame by mutableStateOf<Bitmap?>(null)
-    private var _width by mutableStateOf(1200)
-    private var _height by mutableStateOf(481)
-
-    override val width: Int
-        get() = _width.coerceAtLeast(1)
-
-    override val height: Int
-        get() = _height.coerceAtLeast(120)
-
-    /**
-     * Receives SDK-rendered ECG image bytes and publishes the decoded bitmap on
-     * the main thread for Compose rendering.
-     */
-    override fun render(imageBytes: ByteArray) {
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return
-        _mainHandler.post {
-            Frame = bitmap
-        }
-    }
-
-    /** Stores the current Compose container size for SDK frame rendering. */
-    fun Resized(width: Int, height: Int) {
-        _width = width.coerceAtLeast(1)
-        _height = height.coerceAtLeast(120)
-    }
-}
-
-/**
  * ECG workflow view that owns the SDK render target and forwards lifecycle,
  * readings, errors, and recording button clicks to its view model.
  */
@@ -1879,9 +1932,7 @@ private class EcgView(
     private val _medWandController = medWandController
     private val _viewModel = EcgViewModel(_medWandController, capturesFile, locked)
 
-    val GridContainer = EcgGridContainer()
-
-    override val MedWandSensor: EnumSensor = EnumSensor.Ecg
+    override val MedWandSensor: MedWandSensor = com.medwand.sdk_core.MedWandSensor.Ecg
     override var ViewLockStateChanged: ((Boolean) -> Unit)? = null
 
     /**
@@ -1899,7 +1950,7 @@ private class EcgView(
     }
 
     /** Forwards SDK reading-state changes into ECG captured-count status text. */
-    override fun OnReadingStateChanged(readingState: EnumReadingState) =
+    override fun OnReadingStateChanged(readingState: ReadingState) =
         _viewModel.OnReadingStateChanged(readingState)
 
     /** Stores ECG SDK readings without drawing ECG frames in application code. */
@@ -1910,15 +1961,22 @@ private class EcgView(
     override fun OnDeviceError(error: MedWandDeviceError?) =
         _viewModel.OnDeviceError(error)
 
-    /** No extra ECG view resources are owned beyond the view model and render target. */
+    fun AttachRenderView(view: ImageView) {
+        _medWandController.Configure(view)
+    }
+
+    fun DetachRenderView(view: ImageView) {
+        view.setImageDrawable(null)
+        _medWandController.Configure(null)
+    }
+
     override fun close() {
         _viewModel.close()
     }
 
-    /** Renders ECG status, SDK-controlled grid output, and recording action. */
     @Composable
     override fun Render() {
-        EcgView(_viewModel, GridContainer)
+        EcgView(_viewModel, this)
     }
 }
 
@@ -1947,25 +2005,25 @@ private class EcgViewModel(
     fun Activate() {
         if (!_isActivated) {
             _isActivated = true
-            val ecg = _medWandController.ecg
+            val ecg = _medWandController.Ecg
             if (ecg != null) {
                 // The SDK invokes this callback only when a real recorded strip
                 // is ready; the handler records that SDK output.
-                ecg.onRecordedStripReady = { bytes -> Ecg_RecordedStripReady(bytes) }
+                ecg.RecordedStripReady = { bytes -> Ecg_RecordedStripReady(bytes) }
             }
         }
 
         _reading = MedWandReading().apply {
-            timeStamp = Instant.now()
-            status = ""
-            index = 1
-            count = 0
-            sensorType = EnumSensor.Ecg.name
-            tempAmbient = ""
-            tempObject = ""
-            pulseRate = null
-            spo2 = null
-            ecgData = null
+            TimeStamp = Instant.now()
+            Status = ""
+            Index = 1
+            Count = 0
+            SensorType = MedWandSensor.Ecg.name
+            TempAmbient = ""
+            TempObject = ""
+            PulseRate = null
+            Spo2 = null
+            EcgData = null
         }
         SetAction(ActionState.Idle)
         SetStatus("Monitoring")
@@ -1977,16 +2035,16 @@ private class EcgViewModel(
      */
     fun Deactivate() {
         StopSensor()
-        val ecg = _medWandController.ecg
+        val ecg = _medWandController.Ecg
         if (ecg == null) {
             return
         }
-        ecg.onRecordedStripReady = null
+        ecg.RecordedStripReady = null
         SetStatus("Not Monitoring")
     }
 
     /** Updates the ECG status label with the SDK state and current capture count. */
-    fun OnReadingStateChanged(state: EnumReadingState) {
+    fun OnReadingStateChanged(state: ReadingState) {
         SetStatus(state.toString())
     }
 
@@ -2025,9 +2083,8 @@ private class EcgViewModel(
             SetAction(ActionState.Disabled)
             _setLocked(true)
 
-            // Starts the SDK ECG monitoring stream for the configured
-            // GridContainer render target.
-            if (_medWandController.startEcg()) {
+            // Starts the SDK ECG monitoring stream for the configured ImageView.
+            if (_medWandController.StartEcg()) {
                 SetAction(ActionState.Idle)
             } else {
                 SetAction(ActionState.Disabled)
@@ -2045,7 +2102,7 @@ private class EcgViewModel(
         try {
             SetAction(ActionState.Disabled)
             // Stops the SDK's active sensor without requesting timeout handling.
-            _medWandController.stopSensor(false)
+            _medWandController.StopSensor()
             SetAction(ActionState.Idle)
         } catch (outerEx: Exception) {
             println(outerEx.message)
@@ -2079,7 +2136,7 @@ private class EcgViewModel(
             }
         }
 
-        SetStatus(_medWandController.readingState.toString())
+        SetStatus(_medWandController.ReadingState.toString())
     }
 
     /** Sets the action button to the active-recording Stop Recording state. */
@@ -2106,14 +2163,14 @@ private class EcgViewModel(
     /** Starts a real ECG recording through the SDK without restarting monitoring. */
     private fun StartCapture() {
         SetAction(ActionState.Disabled)
-        _medWandController.startRecording()
+        _medWandController.StartRecording()
         SetAction(ActionState.Busy)
     }
 
     /** Stops the active ECG recording through the SDK without stopping monitoring. */
     private fun StopCapture() {
         SetAction(ActionState.Disabled)
-        _medWandController.stopRecording()
+        _medWandController.StopRecording()
         SetAction(ActionState.Idle)
     }
 
@@ -2122,7 +2179,7 @@ private class EcgViewModel(
      * appends the result to the app-private captures file.
      */
     private fun Ecg_RecordedStripReady(bytes: ByteArray) {
-        _capturesFile.appendText("[${Instant.now()}] -> ${_medWandController.ecgBmpFromCapture(bytes)}\n")
+        _capturesFile.appendText("[${Instant.now()}] -> ${_medWandController.EcgBmpFromCapture(bytes)}\n")
         _captured++
     }
 
@@ -2153,19 +2210,30 @@ private fun MedWandSdkSampleApplication(MainWindow: MainWindow) {
     }
 
     if (MainWindow.StartupNoticeAccepted) {
-        // Shell chrome: top toolbar, center content frame, and bottom status bar.
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .systemBarsPadding()
-                .background(ControlDarkBrush)
-        ) {
-            ToolBar(MainWindow)
-            // MainFrame owns the placeholder/workflow content region.
-            Box(modifier = Modifier.weight(1f)) {
+        if (MainWindow.FirmwareUpdateVisible) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .systemBarsPadding()
+                    .background(ActionButtonDisabled)
+            ) {
                 MainWindow.MainFrame()
             }
-            StatusBar(MainWindow.StatusMessage)
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .systemBarsPadding()
+                    .background(ControlDarkBrush)
+            ) {
+                ToolBar(MainWindow)
+
+                Box(modifier = Modifier.weight(1f)) {
+                    MainWindow.MainFrame()
+                }
+
+                StatusBar(MainWindow.StatusMessage)
+            }
         }
     } else {
         StartupNotice(MainWindow::ContinueStartupNotice)
@@ -2647,13 +2715,16 @@ private fun StethoscopeModeButton(
 @Composable
 private fun CameraView(view: CameraView) {
     val context = LocalContext.current
-    val previewSurface = remember(context) { CameraPreviewSurface(context) }
-
-    DisposableEffect(view, previewSurface) {
-        view.AttachPreviewSurface(previewSurface)
-        onDispose {
-            view.DetachPreviewSurface(previewSurface)
+    val previewView = remember(context) {
+        ImageView(context).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(android.graphics.Color.BLACK)
         }
+    }
+
+    DisposableEffect(view, previewView) {
+        view.AttachPreviewView(previewView)
+        onDispose { view.DetachPreviewView(previewView) }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -2689,7 +2760,7 @@ private fun CameraView(view: CameraView) {
                 contentAlignment = Alignment.Center
             ) {
                 AndroidView(
-                    factory = { previewSurface },
+                    factory = { previewView },
                     modifier = Modifier.fillMaxSize()
                 )
 
@@ -2706,7 +2777,7 @@ private fun CameraView(view: CameraView) {
 
             Column(
                 modifier = Modifier
-                    .width(118.dp)
+                    .width(150.dp)
                     .fillMaxHeight()
                     .background(ControlDarkBrush)
                     .padding(horizontal = 7.dp, vertical = 7.dp),
@@ -2823,7 +2894,7 @@ private fun CameraControls(view: CameraView) {
             }
 
             if (view.ManualFocusAvailable) {
-                var focusSliderValue by remember(view.FocusValue, view.FocusValueMax) {
+                var focusSliderValue by remember(view.FocusValue, view.FocusValueMin, view.FocusValueMax) {
                     mutableStateOf(view.FocusValue.toFloat())
                 }
                 Text("Manual value: ${focusSliderValue.roundToInt()}", fontSize = 11.sp)
@@ -2833,7 +2904,7 @@ private fun CameraControls(view: CameraView) {
                     onValueChangeFinished = {
                         view.SetFocusValue(focusSliderValue.roundToInt())
                     },
-                    valueRange = 0f..view.FocusValueMax.coerceAtLeast(1).toFloat(),
+                    valueRange = view.FocusValueMin.toFloat()..view.FocusValueMax.coerceAtLeast(view.FocusValueMin + 1).toFloat(),
                     enabled = enabled && view.ManualFocusEnabled,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -2851,19 +2922,21 @@ private fun CameraControls(view: CameraView) {
             }
             CameraControlButton("↓", enabled) { view.MoveOtoscope(vertical = 1) }
             Spacer(Modifier.height(6.dp))
-            Text("Circle", fontSize = 12.sp)
-            Row {
-                CameraControlButton("−", enabled) { view.ChangeOtoscopeRadius(-1) }
-                Spacer(Modifier.width(4.dp))
-                CameraControlButton("+", enabled) { view.ChangeOtoscopeRadius(1) }
-            }
-            Spacer(Modifier.height(6.dp))
             Text("Zoom", fontSize = 12.sp)
             Row {
                 CameraControlButton("−", enabled) { view.ZoomOtoscope(-1) }
                 Spacer(Modifier.width(4.dp))
                 CameraControlButton("+", enabled) { view.ZoomOtoscope(1) }
             }
+            Spacer(Modifier.height(6.dp))
+            Text("Radius", fontSize = 12.sp)
+            Row {
+                CameraControlButton("−", enabled) { view.RadiusOtoscope(-1) }
+                Spacer(Modifier.width(4.dp))
+                CameraControlButton("+", enabled) { view.RadiusOtoscope(1) }
+            }
+            Spacer(Modifier.height(6.dp))
+            CameraControlButton("Reset", enabled) { view.ResetOtoscope() }
         }
     }
 }
@@ -2935,11 +3008,11 @@ private fun CameraModeButton(mode: CameraHelper.CameraModes, view: CameraView) {
 }
 
 /**
- * ECG content region with title, SDK-controlled GridContainer, captured-count
+ * ECG content region with title, SDK-controlled ImageView, captured-count
  * status, and recording action button.
  */
 @Composable
-private fun EcgView(_viewModel: EcgViewModel, GridContainer: EcgGridContainer) {
+private fun EcgView(_viewModel: EcgViewModel, view: EcgView) {
     Column(modifier = Modifier.fillMaxSize()) {
         // Workflow title bar.
         Box(
@@ -2957,25 +3030,24 @@ private fun EcgView(_viewModel: EcgViewModel, GridContainer: EcgGridContainer) {
                 modifier = Modifier.padding(horizontal = 10.dp)
             )
         }
-        // SDK-controlled ECG display container; the app only displays the
-        // latest bitmap frame provided through EcgGridContainer.render().
-        Box(
+        val context = LocalContext.current
+        val ecgImageView = remember(context) {
+            ImageView(context).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setBackgroundColor(android.graphics.Color.BLACK)
+            }
+        }
+        DisposableEffect(view, ecgImageView) {
+            view.AttachRenderView(ecgImageView)
+            onDispose { view.DetachRenderView(ecgImageView) }
+        }
+        AndroidView(
+            factory = { ecgImageView },
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .background(ControlDarkDarkBrush)
-                .onSizeChanged { size -> GridContainer.Resized(size.width, size.height) },
-            contentAlignment = Alignment.Center
-        ) {
-            GridContainer.Frame?.let { frame ->
-                Image(
-                    bitmap = frame.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-        }
+        )
         // Workflow status strip includes current SDK state and capture count.
         Box(
             modifier = Modifier
@@ -3043,6 +3115,8 @@ private fun MessageBoxResult.buttonText(): String =
         MessageBoxResult.Cancel -> "Cancel"
         MessageBoxResult.Yes -> "Yes"
         MessageBoxResult.No -> "No"
+        MessageBoxResult.StartFirmwareUpdate -> "Start firmware update"
+        MessageBoxResult.Exit -> "Exit"
     }
 
 /**
