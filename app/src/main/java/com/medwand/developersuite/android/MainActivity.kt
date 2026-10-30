@@ -1442,8 +1442,15 @@ private class StethoscopeView(
 
     fun SetStethoscopeMode(mode: StethoscopeHelpers.MicrophoneModes) {
         if (ButtonActionState == ActionState.Busy) StopCapture()
-        runCatching { _controller.SetStethoscopeMode(mode, null) }
-            .onFailure { println(it.message) }
+        runCatching {
+            // Use this call to set the stethoscope mode without using the MedWand SDK audio stack.
+            // You will be responsible for using your own audio stack to hear and capture the audio.
+            //_controller.SetStethoscopeMode(stethoscopeMode);
+
+            // Use this call to set the stethoscope mode which uses the MedWand SDK audio stack.
+            // The MedWand SDK audio stack handles preview and capturing the audio.
+            _controller.SetStethoscopeMode(mode, null)
+        }.onFailure { println(it.message) }
         StethoscopeMode = _controller.StethoscopeMode
         UpdateStatus()
     }
