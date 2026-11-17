@@ -76,8 +76,7 @@ dependencies {
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
-    // Local MedWand Android SDK used directly by the workflow view models.
-    implementation(files("libs/android-sdk-beta_0.0.0.5.aar"))
+    implementation("com.medwand:mwsdk:3.0.2.2")
     implementation("com.herohan:UVCAndroid:1.0.11")
 
     implementation("androidx.activity:activity-compose:1.9.0")
